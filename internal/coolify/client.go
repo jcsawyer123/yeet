@@ -248,3 +248,126 @@ func (c *Client) ListEnvironments(projectUUID string) ([]Environment, error) {
 	err := c.do(http.MethodGet, "/api/v1/projects/"+projectUUID+"/environments", nil, &out)
 	return out, err
 }
+
+// --- Source-agnostic create dispatch ---
+//
+// DeploySpec/CreateFromSpec exist so there is exactly one place that maps
+// a "what to deploy" description onto the right Coolify create endpoint.
+// It's used both by the interactive /api/deploy handler and by the
+// reaper's reset-via-recreate policy - without this, those two callers
+// would each need their own copy of the same four-way dispatch.
+
+type DeploySpec struct {
+	SourceType         string // "github" | "public" | "dockerfile" | "compose"
+	ProjectUUID        string
+	ServerUUID         string
+	EnvironmentName    string
+	GithubAppUUID      string
+	GitRepository      string
+	GitBranch          string
+	BuildPack          string
+	Dockerfile         string
+	Compose            string
+	PortsExposes       string
+	Name               string
+	Description        string
+	Domains            string
+	HealthCheckEnabled bool
+	HealthCheckPath    string
+}
+
+type DeployResult struct {
+	UUID string
+	Kind string // "application" | "service"
+}
+
+func (c *Client) CreateFromSpec(spec DeploySpec) (*DeployResult, error) {
+	switch spec.SourceType {
+	case "github":
+		res, err := c.CreatePrivateGithubApp(PrivateGithubAppRequest{
+			ProjectUUID:         spec.ProjectUUID,
+			ServerUUID:          spec.ServerUUID,
+			EnvironmentName:     spec.EnvironmentName,
+			GithubAppUUID:       spec.GithubAppUUID,
+			GitRepository:       spec.GitRepository,
+			GitBranch:           spec.GitBranch,
+			BuildPack:           spec.BuildPack,
+			PortsExposes:        spec.PortsExposes,
+			Name:                spec.Name,
+			Description:         spec.Description,
+			Domains:             spec.Domains,
+			IsAutoDeployEnabled: true,
+			HealthCheckEnabled:  spec.HealthCheckEnabled,
+			HealthCheckPath:     spec.HealthCheckPath,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &DeployResult{UUID: res.UUID, Kind: "application"}, c.DeployApplication(res.UUID)
+
+	case "public":
+		res, err := c.CreatePublicRepo(PublicRepoRequest{
+			ProjectUUID:        spec.ProjectUUID,
+			ServerUUID:         spec.ServerUUID,
+			EnvironmentName:    spec.EnvironmentName,
+			GitRepository:      spec.GitRepository,
+			GitBranch:          spec.GitBranch,
+			BuildPack:          spec.BuildPack,
+			PortsExposes:       spec.PortsExposes,
+			Name:               spec.Name,
+			Description:        spec.Description,
+			Domains:            spec.Domains,
+			HealthCheckEnabled: spec.HealthCheckEnabled,
+			HealthCheckPath:    spec.HealthCheckPath,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &DeployResult{UUID: res.UUID, Kind: "application"}, c.DeployApplication(res.UUID)
+
+	case "dockerfile":
+		res, err := c.CreateDockerfile(DockerfileRequest{
+			ProjectUUID:        spec.ProjectUUID,
+			ServerUUID:         spec.ServerUUID,
+			EnvironmentName:    spec.EnvironmentName,
+			Dockerfile:         spec.Dockerfile,
+			BuildPack:          "dockerfile",
+			PortsExposes:       spec.PortsExposes,
+			Name:               spec.Name,
+			Description:        spec.Description,
+			Domains:            spec.Domains,
+			HealthCheckEnabled: spec.HealthCheckEnabled,
+			HealthCheckPath:    spec.HealthCheckPath,
+		})
+		if err != nil {
+			return nil, err
+		}
+		// Coolify's dockerfile-create endpoint ignores ports_exposes and
+		// (due to a bug) always falls back to port 80 - patch the real
+		// port in before deploying so the Traefik routing label is right.
+		if spec.PortsExposes != "" {
+			if err := c.UpdateApplicationPortsExposes(res.UUID, spec.PortsExposes); err != nil {
+				return nil, err
+			}
+		}
+		return &DeployResult{UUID: res.UUID, Kind: "application"}, c.DeployApplication(res.UUID)
+
+	case "compose":
+		res, err := c.CreateService(ServiceRequest{
+			ProjectUUID:      spec.ProjectUUID,
+			ServerUUID:       spec.ServerUUID,
+			EnvironmentName:  spec.EnvironmentName,
+			Name:             spec.Name,
+			Description:      spec.Description,
+			DockerComposeRaw: spec.Compose,
+			InstantDeploy:    true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &DeployResult{UUID: res.UUID, Kind: "service"}, nil
+
+	default:
+		return nil, fmt.Errorf("unknown source type %q (want github, public, dockerfile, or compose)", spec.SourceType)
+	}
+}
