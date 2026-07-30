@@ -91,7 +91,14 @@
 const panels = document.querySelectorAll(".type-panel");
 const typeSel = document.getElementById("type");
 function syncPanels() {
-  panels.forEach(p => p.classList.toggle("active", p.dataset.type === typeSel.value));
+  panels.forEach(p => {
+    const active = p.dataset.type === typeSel.value;
+    p.classList.toggle("active", active);
+    // disabled fields are excluded from FormData - without this, hidden
+    // panels' empty inputs (duplicate names like "repository"/"port")
+    // silently overwrite the active panel's values on submit.
+    p.querySelectorAll("input, textarea").forEach(el => { el.disabled = !active; });
+  });
 }
 typeSel.addEventListener("change", syncPanels);
 syncPanels();
