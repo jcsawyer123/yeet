@@ -144,6 +144,17 @@ func (c *Client) UpdateApplicationDomains(uuid, domains string) error {
 	return c.do(http.MethodPatch, "/api/v1/applications/"+uuid, map[string]string{"domains": domains}, nil)
 }
 
+// UpdateApplicationPortsExposes overrides the exposed port after creation.
+// Needed for dockerfile-type apps: Coolify's create endpoint is meant to
+// infer the port from the Dockerfile's EXPOSE line, but as of Coolify 4.1.2
+// it reads the still-base64-encoded request field instead of the decoded
+// one, so the parse never matches and it silently falls back to 80
+// (app/Http/Controllers/Api/ApplicationsController.php:1717). This patches
+// the real port in before the app is deployed.
+func (c *Client) UpdateApplicationPortsExposes(uuid, port string) error {
+	return c.do(http.MethodPatch, "/api/v1/applications/"+uuid, map[string]string{"ports_exposes": port}, nil)
+}
+
 func (c *Client) DeployApplication(uuid string) error {
 	return c.do(http.MethodPost, "/api/v1/applications/"+uuid+"/start", nil, nil)
 }
