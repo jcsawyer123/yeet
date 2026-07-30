@@ -1,0 +1,159 @@
+{{define "index.html"}}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yeet</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 -apple-system, system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1.25rem; }
+  h1 { font-size: 1.4rem; margin-bottom: 0; }
+  .sub { color: #888; margin-top: .15rem; margin-bottom: 2rem; }
+  fieldset { border: 1px solid #8883; border-radius: 6px; padding: 1rem; margin-bottom: 1.5rem; }
+  legend { padding: 0 .4rem; }
+  label { display: block; font-size: .85rem; margin: .6rem 0 .2rem; }
+  input, select, textarea { width: 100%; box-sizing: border-box; padding: .5rem; font: inherit; border: 1px solid #8886; border-radius: 4px; background: transparent; color: inherit; }
+  textarea { min-height: 8rem; font-family: ui-monospace, monospace; font-size: .85rem; }
+  button { padding: .55rem 1.1rem; font: inherit; border: none; border-radius: 4px; background: #2563eb; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .type-panel { display: none; }
+  .type-panel.active { display: block; }
+  #result { margin-top: 1rem; padding: .75rem; border-radius: 4px; display: none; }
+  #result.ok { display: block; background: #16a34a22; border: 1px solid #16a34a55; }
+  #result.err { display: block; background: #dc262622; border: 1px solid #dc262655; }
+  #result a { font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
+  td, th { text-align: left; padding: .4rem .3rem; border-bottom: 1px solid #8883; font-size: .85rem; }
+  .row-actions button { padding: .25rem .55rem; font-size: .8rem; margin-right: .3rem; background: #6b728033; color: inherit; }
+  .row-actions button.danger { background: #dc262633; }
+</style>
+</head>
+<body>
+<h1>yeet</h1>
+<p class="sub">hey {{.Who}} — deploy something to *.{{.BaseDomain}}</p>
+
+<form id="deploy-form">
+  <label>Type</label>
+  <select id="type" name="type">
+    <option value="github">Private GitHub repo</option>
+    <option value="public">Public git repo</option>
+    <option value="dockerfile">Dockerfile</option>
+    <option value="compose">docker-compose</option>
+  </select>
+
+  <div class="type-panel" data-type="github">
+    <label>Repository (owner/repo)</label>
+    <input name="repository" placeholder="jcsawyer123/some-project">
+    <label>Branch</label>
+    <input name="branch" placeholder="main">
+    <label>Port</label>
+    <input name="port" placeholder="8080">
+  </div>
+
+  <div class="type-panel" data-type="public">
+    <label>Git URL</label>
+    <input name="repository" placeholder="https://github.com/someone/project">
+    <label>Branch</label>
+    <input name="branch" placeholder="main">
+    <label>Port</label>
+    <input name="port" placeholder="8080">
+  </div>
+
+  <div class="type-panel" data-type="dockerfile">
+    <label>Dockerfile contents</label>
+    <textarea name="dockerfile" placeholder="FROM ..."></textarea>
+    <label>Port</label>
+    <input name="port" placeholder="8080">
+  </div>
+
+  <div class="type-panel" data-type="compose">
+    <label>docker-compose.yml contents</label>
+    <textarea name="compose" placeholder="services:&#10;  app:&#10;    image: ..."></textarea>
+  </div>
+
+  <label>Name (optional — random if left blank)</label>
+  <input name="name" placeholder="leave blank to auto-generate">
+
+  <div style="margin-top:1rem">
+    <button type="submit">Deploy</button>
+  </div>
+</form>
+
+<div id="result"></div>
+
+<h2 style="margin-top:2.5rem; font-size:1.1rem">Your deployments</h2>
+<table id="list"><tbody></tbody></table>
+
+<script>
+const panels = document.querySelectorAll(".type-panel");
+const typeSel = document.getElementById("type");
+function syncPanels() {
+  panels.forEach(p => p.classList.toggle("active", p.dataset.type === typeSel.value));
+}
+typeSel.addEventListener("change", syncPanels);
+syncPanels();
+
+document.getElementById("deploy-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const btn = e.target.querySelector("button");
+  const result = document.getElementById("result");
+  const fd = new FormData(e.target);
+  const body = Object.fromEntries(fd.entries());
+
+  btn.disabled = true;
+  result.className = "";
+  result.textContent = "";
+
+  try {
+    const res = await fetch("/api/deploy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    result.className = "ok";
+    result.innerHTML = `Deployed: <a href="${data.url}" target="_blank">${data.url}</a>`;
+    loadList();
+  } catch (err) {
+    result.className = "err";
+    result.textContent = "Error: " + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function loadList() {
+  const res = await fetch("/api/list");
+  const items = await res.json();
+  const tbody = document.querySelector("#list tbody");
+  tbody.innerHTML = "";
+  (items || []).forEach(item => {
+    const tr = document.createElement("tr");
+    const base = item.kind === "application" ? "/api/apps/" : "/api/services/";
+    tr.innerHTML = `
+      <td>${item.name}</td>
+      <td>${item.kind}</td>
+      <td class="row-actions">
+        <button data-action="stop">stop</button>
+        <button data-action="start">start</button>
+        <button data-action="delete" class="danger">delete</button>
+      </td>`;
+    tr.querySelectorAll("button").forEach(b => {
+      b.addEventListener("click", async () => {
+        const action = b.dataset.action;
+        const method = action === "delete" ? "DELETE" : "POST";
+        const path = action === "delete" ? base + item.uuid : base + item.uuid + "/" + action;
+        await fetch(path, { method });
+        loadList();
+      });
+    });
+    tbody.appendChild(tr);
+  });
+}
+loadList();
+</script>
+</body>
+</html>
+{{end}}
