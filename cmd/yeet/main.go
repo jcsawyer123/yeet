@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -13,8 +14,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/jcsawyer123/yeet/internal/coolify"
+	"github.com/jcsawyer123/yeet/internal/reconcile"
+	"github.com/jcsawyer123/yeet/internal/store"
 )
 
 //go:embed web/*.html
@@ -31,6 +35,7 @@ type config struct {
 	DashboardURL    string
 	ListenAddr      string
 	SelfUUID        string
+	DBPath          string
 }
 
 func loadConfig() config {
@@ -49,6 +54,10 @@ func loadConfig() config {
 		// you can't stop/delete the tool out from under yourself. Empty in
 		// local dev, which is fine: nothing to exclude.
 		SelfUUID: os.Getenv("COOLIFY_RESOURCE_UUID"),
+		// Should point at a Coolify persistent volume in production -
+		// otherwise every redeploy wipes yeet's local state. Defaults to a
+		// relative path for local dev, where that doesn't matter.
+		DBPath: envOr("YEET_DB_PATH", "yeet.db"),
 	}
 	if cfg.EnvironmentName == "" {
 		cfg.EnvironmentName = "production"
@@ -103,6 +112,17 @@ func main() {
 		tmpl:   template.Must(template.ParseFS(webFS, "web/*.html")),
 	}
 	s.resolveEnvironmentUUID()
+
+	// Non-fatal: yeet's core deploy/list/manage flow doesn't depend on the
+	// database yet (Phase 1 is reconciliation only, nothing user-visible
+	// reads from it), so a DB problem shouldn't take the whole tool down.
+	db, err := store.Open(cfg.DBPath)
+	if err != nil {
+		log.Printf("warning: could not open database at %q, reconciliation disabled: %v", cfg.DBPath, err)
+	} else {
+		defer db.Close()
+		go reconcile.New(s.client, db, cfg.SelfUUID).Run(context.Background(), 30*time.Second)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleIndex)
