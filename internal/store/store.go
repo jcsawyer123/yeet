@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -92,4 +93,217 @@ func (db *DB) LiveCoolifyUUIDs() ([]string, error) {
 		uuids = append(uuids, uuid)
 	}
 	return uuids, rows.Err()
+}
+
+// ProjectSpec is a source-agnostic description of what a project deploys,
+// stored so the reaper can recreate an instance for a reset policy without
+// yeet having to remember or re-fetch the original request.
+type ProjectSpec struct {
+	Name                 string
+	SourceType           string // "github" | "public" | "dockerfile" | "compose"
+	GitRepository        string
+	GitBranch            string
+	BuildPack            string
+	DockerfileBlob       string
+	ComposeBlob          string
+	PortsExposes         string
+	TTLSeconds           *int64
+	ResetIntervalSeconds *int64
+	ExpiryAction         string // "stop" | "delete"
+}
+
+// CreateProjectWithSpec registers a new project with its source spec and
+// policy. Unlike GetOrCreateProject (used for adopting untracked
+// resources), this always inserts - callers know this is a fresh project.
+func (db *DB) CreateProjectWithSpec(spec ProjectSpec) (*Project, error) {
+	expiryAction := spec.ExpiryAction
+	if expiryAction == "" {
+		expiryAction = "stop"
+	}
+	now := time.Now().Unix()
+	_, err := db.sql.Exec(`
+		INSERT INTO project (
+			slug, name, kind, source_type, git_repository, git_branch, build_pack,
+			dockerfile_blob, compose_blob, ports_exposes, ttl_seconds,
+			reset_interval_seconds, expiry_action, created_at, updated_at
+		) VALUES (?, ?, 'adhoc', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		spec.Name, spec.Name, spec.SourceType, spec.GitRepository, spec.GitBranch, spec.BuildPack,
+		spec.DockerfileBlob, spec.ComposeBlob, spec.PortsExposes, spec.TTLSeconds,
+		spec.ResetIntervalSeconds, expiryAction, now, now)
+	if err != nil {
+		return nil, fmt.Errorf("create project %q: %w", spec.Name, err)
+	}
+
+	var p Project
+	err = db.sql.QueryRow(`SELECT id, slug, name, kind FROM project WHERE slug = ?`, spec.Name).
+		Scan(&p.ID, &p.Slug, &p.Name, &p.Kind)
+	if err != nil {
+		return nil, fmt.Errorf("fetch project %q: %w", spec.Name, err)
+	}
+	return &p, nil
+}
+
+// CreateInstance inserts a freshly-created instance with any TTL/reset
+// policy computed into concrete deadlines. Unlike UpsertInstance (used by
+// the reconciler for resources it didn't create), a conflict here is a
+// genuine bug - the coolify_uuid was just minted - so it's a plain INSERT.
+func (db *DB) CreateInstance(projectID int64, shortID, coolifyUUID, coolifyKind string, ttlSeconds, resetIntervalSeconds *int64) error {
+	now := time.Now()
+	var expiresAt, nextResetAt *int64
+	if ttlSeconds != nil {
+		v := now.Add(time.Duration(*ttlSeconds) * time.Second).Unix()
+		expiresAt = &v
+	}
+	if resetIntervalSeconds != nil {
+		v := now.Add(time.Duration(*resetIntervalSeconds) * time.Second).Unix()
+		nextResetAt = &v
+	}
+	_, err := db.sql.Exec(`
+		INSERT INTO instance (project_id, short_id, coolify_uuid, coolify_kind, expires_at, next_reset_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		projectID, shortID, coolifyUUID, coolifyKind, expiresAt, nextResetAt, now.Unix())
+	if err != nil {
+		return fmt.Errorf("create instance %q: %w", coolifyUUID, err)
+	}
+	return nil
+}
+
+// EnforceableInstance is a live instance joined with its project's policy -
+// everything the reaper needs to decide on and carry out an action.
+type EnforceableInstance struct {
+	InstanceID           int64
+	ProjectID            int64
+	CoolifyUUID          string
+	CoolifyKind          string
+	FQDN                 string
+	ExpiresAt            *time.Time
+	NextResetAt          *time.Time
+	ExpiryAction         string
+	ResetIntervalSeconds *int64
+	Spec                 ProjectSpec
+}
+
+// ListEnforceable returns every live instance whose project has a TTL or
+// reset policy configured. Instances adopted without a policy (legacy
+// resources, or projects created without one) are excluded at the SQL
+// level so the reaper never has to special-case them.
+func (db *DB) ListEnforceable() ([]EnforceableInstance, error) {
+	rows, err := db.sql.Query(`
+		SELECT i.id, i.project_id, i.coolify_uuid, i.coolify_kind, i.fqdn, i.expires_at, i.next_reset_at,
+		       p.expiry_action, p.reset_interval_seconds, p.name, p.source_type, p.git_repository,
+		       p.git_branch, p.build_pack, p.dockerfile_blob, p.compose_blob, p.ports_exposes
+		FROM instance i
+		JOIN project p ON p.id = i.project_id
+		WHERE i.deleted_at IS NULL
+		  AND (i.expires_at IS NOT NULL OR i.next_reset_at IS NOT NULL)`)
+	if err != nil {
+		return nil, fmt.Errorf("list enforceable instances: %w", err)
+	}
+	defer rows.Close()
+
+	var out []EnforceableInstance
+	for rows.Next() {
+		var e EnforceableInstance
+		var fqdn sql.NullString
+		var expiresAt, nextResetAt, resetIntervalSeconds sql.NullInt64
+		if err := rows.Scan(
+			&e.InstanceID, &e.ProjectID, &e.CoolifyUUID, &e.CoolifyKind, &fqdn, &expiresAt, &nextResetAt,
+			&e.ExpiryAction, &resetIntervalSeconds, &e.Spec.Name, &e.Spec.SourceType, &e.Spec.GitRepository,
+			&e.Spec.GitBranch, &e.Spec.BuildPack, &e.Spec.DockerfileBlob, &e.Spec.ComposeBlob, &e.Spec.PortsExposes,
+		); err != nil {
+			return nil, fmt.Errorf("scan enforceable instance: %w", err)
+		}
+		e.FQDN = fqdn.String
+		if expiresAt.Valid {
+			t := time.Unix(expiresAt.Int64, 0)
+			e.ExpiresAt = &t
+		}
+		if nextResetAt.Valid {
+			t := time.Unix(nextResetAt.Int64, 0)
+			e.NextResetAt = &t
+		}
+		if resetIntervalSeconds.Valid {
+			e.ResetIntervalSeconds = &resetIntervalSeconds.Int64
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ClearInstanceExpiry stops a TTL from re-firing every tick once it's been
+// acted on (stop is a one-shot action, not recurring).
+func (db *DB) ClearInstanceExpiry(instanceID int64) error {
+	_, err := db.sql.Exec(`UPDATE instance SET expires_at = NULL WHERE id = ?`, instanceID)
+	if err != nil {
+		return fmt.Errorf("clear expiry for instance %d: %w", instanceID, err)
+	}
+	return nil
+}
+
+// ApplyReset records that an instance was recreated: its coolify_uuid
+// changes (the old resource was deleted and a new one made), and its next
+// reset deadline moves forward. observed_state/fqdn are cleared here and
+// refreshed by the next call to UpdateInstanceObserved.
+func (db *DB) ApplyReset(instanceID int64, newCoolifyUUID string, resetIntervalSeconds int64) error {
+	next := time.Now().Add(time.Duration(resetIntervalSeconds) * time.Second).Unix()
+	_, err := db.sql.Exec(`
+		UPDATE instance
+		SET coolify_uuid = ?, next_reset_at = ?, observed_state = NULL, observed_at = NULL
+		WHERE id = ?`,
+		newCoolifyUUID, next, instanceID)
+	if err != nil {
+		return fmt.Errorf("apply reset for instance %d: %w", instanceID, err)
+	}
+	return nil
+}
+
+// RecordEvent appends to an instance's audit trail. instanceID may be nil
+// for project-level events with no single instance to attach to.
+func (db *DB) RecordEvent(instanceID *int64, projectID int64, kind, detail string) error {
+	_, err := db.sql.Exec(`
+		INSERT INTO instance_event (instance_id, project_id, kind, detail, created_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		instanceID, projectID, kind, detail, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("record event: %w", err)
+	}
+	return nil
+}
+
+type InstancePolicy struct {
+	ExpiresAt   *time.Time
+	NextResetAt *time.Time
+}
+
+// ListInstancePolicies returns TTL/reset deadlines for every live instance
+// that has one, keyed by coolify_uuid, for the UI to show a countdown
+// without an N+1 query per listed item.
+func (db *DB) ListInstancePolicies() (map[string]InstancePolicy, error) {
+	rows, err := db.sql.Query(`
+		SELECT coolify_uuid, expires_at, next_reset_at FROM instance
+		WHERE deleted_at IS NULL AND (expires_at IS NOT NULL OR next_reset_at IS NOT NULL)`)
+	if err != nil {
+		return nil, fmt.Errorf("list instance policies: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]InstancePolicy)
+	for rows.Next() {
+		var uuid string
+		var expiresAt, nextResetAt sql.NullInt64
+		if err := rows.Scan(&uuid, &expiresAt, &nextResetAt); err != nil {
+			return nil, fmt.Errorf("scan instance policy: %w", err)
+		}
+		var p InstancePolicy
+		if expiresAt.Valid {
+			t := time.Unix(expiresAt.Int64, 0)
+			p.ExpiresAt = &t
+		}
+		if nextResetAt.Valid {
+			t := time.Unix(nextResetAt.Int64, 0)
+			p.NextResetAt = &t
+		}
+		out[uuid] = p
+	}
+	return out, rows.Err()
 }
