@@ -28,6 +28,7 @@ type config struct {
 	EnvironmentName string
 	GithubAppUUID   string
 	BaseDomain      string
+	DashboardURL    string
 	ListenAddr      string
 }
 
@@ -40,6 +41,7 @@ func loadConfig() config {
 		EnvironmentName: os.Getenv("COOLIFY_ENVIRONMENT_NAME"),
 		GithubAppUUID:   os.Getenv("COOLIFY_GITHUB_APP_UUID"),
 		BaseDomain:      os.Getenv("BASE_DOMAIN"),
+		DashboardURL:    strings.TrimSuffix(envOr("COOLIFY_DASHBOARD_URL", "https://coolify.home.jcsx.me"), "/"),
 		ListenAddr:      ":" + envOr("PORT", "7000"),
 	}
 	if cfg.EnvironmentName == "" {
@@ -71,9 +73,10 @@ func envOr(key, fallback string) string {
 }
 
 type server struct {
-	cfg    config
-	client *coolify.Client
-	tmpl   *template.Template
+	cfg             config
+	client          *coolify.Client
+	tmpl            *template.Template
+	environmentUUID string // resolved best-effort at startup, used only for dashboard deep links
 }
 
 func main() {
@@ -83,6 +86,7 @@ func main() {
 		client: coolify.NewClient(cfg.CoolifyBaseURL, cfg.CoolifyToken),
 		tmpl:   template.Must(template.ParseFS(webFS, "web/*.html")),
 	}
+	s.resolveEnvironmentUUID()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleIndex)
@@ -101,6 +105,35 @@ func main() {
 
 	log.Printf("yeet listening on %s", cfg.ListenAddr)
 	log.Fatal(http.ListenAndServe(cfg.ListenAddr, mux))
+}
+
+// resolveEnvironmentUUID looks up the environment's uuid once at startup.
+// Coolify's dashboard URLs are keyed by environment uuid, not the
+// environment_name used everywhere else in this app's config. Best-effort:
+// dashboard links just degrade to the project overview page if this fails.
+func (s *server) resolveEnvironmentUUID() {
+	envs, err := s.client.ListEnvironments(s.cfg.ProjectUUID)
+	if err != nil {
+		log.Printf("warning: could not resolve environment uuid, dashboard links will be less specific: %v", err)
+		return
+	}
+	for _, e := range envs {
+		if e.Name == s.cfg.EnvironmentName {
+			s.environmentUUID = e.UUID
+			return
+		}
+	}
+	log.Printf("warning: no environment named %q found, dashboard links will be less specific", s.cfg.EnvironmentName)
+}
+
+func (s *server) dashboardLink(kind, uuid string) string {
+	if s.cfg.DashboardURL == "" {
+		return ""
+	}
+	if s.environmentUUID == "" {
+		return s.cfg.DashboardURL + "/project/" + s.cfg.ProjectUUID
+	}
+	return fmt.Sprintf("%s/project/%s/environment/%s/%s/%s", s.cfg.DashboardURL, s.cfg.ProjectUUID, s.environmentUUID, kind, uuid)
 }
 
 func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -248,20 +281,40 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type item struct {
-		UUID        string `json:"uuid"`
-		Name        string `json:"name"`
-		Kind        string `json:"kind"`
-		Description string `json:"description"`
+		UUID          string `json:"uuid"`
+		Name          string `json:"name"`
+		Kind          string `json:"kind"`
+		Description   string `json:"description"`
+		URL           string `json:"url,omitempty"`
+		Status        string `json:"status,omitempty"`
+		GitRepository string `json:"git_repository,omitempty"`
+		DashboardURL  string `json:"dashboard_url,omitempty"`
 	}
 	var out []item
 	for _, a := range apps {
 		if strings.HasPrefix(a.Description, "yeet:") {
-			out = append(out, item{a.UUID, a.Name, "application", a.Description})
+			out = append(out, item{
+				UUID:          a.UUID,
+				Name:          a.Name,
+				Kind:          "application",
+				Description:   a.Description,
+				URL:           a.FQDN,
+				Status:        a.Status,
+				GitRepository: a.GitRepository,
+				DashboardURL:  s.dashboardLink("application", a.UUID),
+			})
 		}
 	}
 	for _, sv := range services {
 		if strings.HasPrefix(sv.Description, "yeet:") {
-			out = append(out, item{sv.UUID, sv.Name, "service", sv.Description})
+			out = append(out, item{
+				UUID:         sv.UUID,
+				Name:         sv.Name,
+				Kind:         "service",
+				Description:  sv.Description,
+				Status:       sv.Status,
+				DashboardURL: s.dashboardLink("service", sv.UUID),
+			})
 		}
 	}
 	writeJSON(w, out)
