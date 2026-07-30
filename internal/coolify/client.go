@@ -206,10 +206,25 @@ type Service struct {
 	UUID        string `json:"uuid"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	Status      string `json:"status"`
 }
 
 func (c *Client) ListServices() ([]Service, error) {
 	var out []Service
 	err := c.do(http.MethodGet, "/api/v1/services", nil, &out)
+	return out, err
+}
+
+// --- Environments (for building dashboard links, which are keyed by
+// environment uuid rather than the environment_name used elsewhere) ---
+
+type Environment struct {
+	UUID string `json:"uuid"`
+	Name string `json:"name"`
+}
+
+func (c *Client) ListEnvironments(projectUUID string) ([]Environment, error) {
+	var out []Environment
+	err := c.do(http.MethodGet, "/api/v1/projects/"+projectUUID+"/environments", nil, &out)
 	return out, err
 }
