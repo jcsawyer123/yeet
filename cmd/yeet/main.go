@@ -30,6 +30,7 @@ type config struct {
 	BaseDomain      string
 	DashboardURL    string
 	ListenAddr      string
+	SelfUUID        string
 }
 
 func loadConfig() config {
@@ -43,6 +44,11 @@ func loadConfig() config {
 		BaseDomain:      os.Getenv("BASE_DOMAIN"),
 		DashboardURL:    strings.TrimSuffix(envOr("COOLIFY_DASHBOARD_URL", "https://coolify.home.jcsx.me"), "/"),
 		ListenAddr:      ":" + envOr("PORT", "7000"),
+		// Coolify injects this into every container it deploys, including
+		// yeet's own - used to exclude yeet from its own deployment list so
+		// you can't stop/delete the tool out from under yourself. Empty in
+		// local dev, which is fine: nothing to exclude.
+		SelfUUID: os.Getenv("COOLIFY_RESOURCE_UUID"),
 	}
 	if cfg.EnvironmentName == "" {
 		cfg.EnvironmentName = "production"
@@ -292,6 +298,9 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	var out []item
 	for _, a := range apps {
+		if a.UUID == s.cfg.SelfUUID {
+			continue
+		}
 		if strings.HasPrefix(a.Description, "yeet:") {
 			out = append(out, item{
 				UUID:          a.UUID,
@@ -306,6 +315,9 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for _, sv := range services {
+		if sv.UUID == s.cfg.SelfUUID {
+			continue
+		}
 		if strings.HasPrefix(sv.Description, "yeet:") {
 			out = append(out, item{
 				UUID:         sv.UUID,
