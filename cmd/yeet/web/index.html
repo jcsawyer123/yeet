@@ -21,6 +21,9 @@
   button:disabled { opacity: .5; cursor: default; }
   .type-panel { display: none; }
   .type-panel.active { display: block; }
+  #advanced { border: 1px solid #8883; border-radius: 6px; padding: .6rem 1rem; margin-top: 1rem; }
+  #advanced summary { cursor: pointer; font-size: .85rem; }
+  #advanced[disabled] { opacity: .5; pointer-events: none; }
   #result { margin-top: 1rem; padding: .75rem; border-radius: 4px; display: none; }
   #result.ok { display: block; background: #16a34a22; border: 1px solid #16a34a55; }
   #result.err { display: block; background: #dc262622; border: 1px solid #dc262655; }
@@ -89,6 +92,17 @@
   <label>Name (optional — random if left blank)</label>
   <input name="name" placeholder="leave blank to auto-generate">
 
+  <details id="advanced">
+    <summary>Advanced</summary>
+    <label style="display:flex; align-items:center; gap:.4rem; margin-top:.6rem">
+      <input type="checkbox" name="health_check_enabled" id="health-check-enabled" style="width:auto">
+      Enable health check
+    </label>
+    <label>Health check path</label>
+    <input name="health_check_path" id="health-check-path" placeholder="/healthz" disabled>
+    <p style="font-size:.75rem; color:#888; margin:.4rem 0 0">Not applied to docker-compose deploys.</p>
+  </details>
+
   <div style="margin-top:1rem">
     <button type="submit">Deploy</button>
   </div>
@@ -102,6 +116,10 @@
 <script>
 const panels = document.querySelectorAll(".type-panel");
 const typeSel = document.getElementById("type");
+const advanced = document.getElementById("advanced");
+const healthCheckEnabled = document.getElementById("health-check-enabled");
+const healthCheckPath = document.getElementById("health-check-path");
+
 function syncPanels() {
   panels.forEach(p => {
     const active = p.dataset.type === typeSel.value;
@@ -111,8 +129,14 @@ function syncPanels() {
     // silently overwrite the active panel's values on submit.
     p.querySelectorAll("input, textarea").forEach(el => { el.disabled = !active; });
   });
+  // health checks aren't wired up for docker-compose deploys
+  const composeSelected = typeSel.value === "compose";
+  advanced.toggleAttribute("disabled", composeSelected);
+  healthCheckEnabled.disabled = composeSelected;
+  healthCheckPath.disabled = composeSelected || !healthCheckEnabled.checked;
 }
 typeSel.addEventListener("change", syncPanels);
+healthCheckEnabled.addEventListener("change", syncPanels);
 syncPanels();
 
 document.getElementById("deploy-form").addEventListener("submit", async (e) => {
@@ -121,6 +145,7 @@ document.getElementById("deploy-form").addEventListener("submit", async (e) => {
   const result = document.getElementById("result");
   const fd = new FormData(e.target);
   const body = Object.fromEntries(fd.entries());
+  body.health_check_enabled = fd.has("health_check_enabled");
 
   btn.disabled = true;
   result.className = "";
@@ -150,6 +175,13 @@ function statusClass(status) {
   if (state === "running") return "status-running";
   if (state === "exited" || state === "stopped") return "status-exited";
   return "status-other";
+}
+
+// "state:unknown" means no health check is configured - showing "unknown"
+// reads as something being wrong when nothing is; just show the state.
+function statusText(status) {
+  const [state, health] = (status || "").split(":");
+  return health === "unknown" ? state : status;
 }
 
 function el(tag, props, ...children) {
@@ -184,7 +216,7 @@ async function loadList() {
 
     const statusCell = document.createElement("td");
     if (item.status) {
-      statusCell.appendChild(el("span", { class: "status-badge " + statusClass(item.status), text: item.status }));
+      statusCell.appendChild(el("span", { class: "status-badge " + statusClass(item.status), text: statusText(item.status) }));
     }
 
     const actionsCell = el("td", { class: "row-actions" },
