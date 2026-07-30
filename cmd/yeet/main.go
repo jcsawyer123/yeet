@@ -78,6 +78,16 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// Coolify hardcodes git_repository to this placeholder for every
+// dockerfile-type app (it's not a real repo) - don't surface it as if it
+// were the app's source.
+func displayGitRepository(repo string) string {
+	if repo == "coollabsio/coolify" {
+		return ""
+	}
+	return repo
+}
+
 type server struct {
 	cfg             config
 	client          *coolify.Client
@@ -247,6 +257,12 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 			HealthCheckEnabled: req.HealthCheckEnabled,
 			HealthCheckPath:    req.HealthCheckPath,
 		})
+		// Coolify's dockerfile-create endpoint ignores ports_exposes and
+		// (due to a bug) always falls back to port 80 - patch the real
+		// port in before deploying so the Traefik routing label is right.
+		if err == nil && req.Port != "" {
+			err = s.client.UpdateApplicationPortsExposes(res.UUID, req.Port)
+		}
 		s.finishDeploy(w, res, "application", domain, err, func() error { return s.client.DeployApplication(res.UUID) })
 
 	case "compose":
@@ -317,7 +333,7 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 				Description:   a.Description,
 				URL:           a.FQDN,
 				Status:        a.Status,
-				GitRepository: a.GitRepository,
+				GitRepository: displayGitRepository(a.GitRepository),
 				DashboardURL:  s.dashboardLink("application", a.UUID),
 			})
 		}
