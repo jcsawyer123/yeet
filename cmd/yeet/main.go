@@ -101,7 +101,8 @@ type server struct {
 	cfg             config
 	client          *coolify.Client
 	tmpl            *template.Template
-	environmentUUID string // resolved best-effort at startup, used only for dashboard deep links
+	environmentUUID string    // resolved best-effort at startup, used only for dashboard deep links
+	db              *store.DB // nil if the database couldn't be opened - policy features degrade to no-ops
 }
 
 func main() {
@@ -114,14 +115,16 @@ func main() {
 	s.resolveEnvironmentUUID()
 
 	// Non-fatal: yeet's core deploy/list/manage flow doesn't depend on the
-	// database yet (Phase 1 is reconciliation only, nothing user-visible
-	// reads from it), so a DB problem shouldn't take the whole tool down.
+	// database (a deploy still works without TTL/reset policy tracking),
+	// so a DB problem shouldn't take the whole tool down.
 	db, err := store.Open(cfg.DBPath)
 	if err != nil {
-		log.Printf("warning: could not open database at %q, reconciliation disabled: %v", cfg.DBPath, err)
+		log.Printf("warning: could not open database at %q, policy tracking disabled: %v", cfg.DBPath, err)
 	} else {
+		s.db = db
 		defer db.Close()
-		go reconcile.New(s.client, db, cfg.SelfUUID).Run(context.Background(), 30*time.Second)
+		go reconcile.New(s.client, db, cfg.SelfUUID, cfg.ProjectUUID, cfg.ServerUUID, cfg.EnvironmentName, cfg.GithubAppUUID).
+			Run(context.Background(), 30*time.Second)
 	}
 
 	mux := http.NewServeMux()
@@ -196,6 +199,12 @@ type deployRequest struct {
 	BuildPack          string `json:"build_pack,omitempty"` // for github/public: nixpacks|dockerfile|dockercompose
 	HealthCheckEnabled bool   `json:"health_check_enabled,omitempty"`
 	HealthCheckPath    string `json:"health_check_path,omitempty"`
+	// Policy (Phase 2): optional. Not supported for "compose" deploys yet -
+	// reset-via-recreate needs a single stable dispatch path per source
+	// type, and services don't need it as urgently as ad-hoc apps do.
+	TTLSeconds           *int64 `json:"ttl_seconds,omitempty"`
+	ResetIntervalSeconds *int64 `json:"reset_interval_seconds,omitempty"`
+	ExpiryAction         string `json:"expiry_action,omitempty"` // "stop" | "delete", default "stop"
 }
 
 type deployResponse struct {
@@ -208,6 +217,10 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	var req deployRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Type == "compose" && (req.TTLSeconds != nil || req.ResetIntervalSeconds != nil) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("ttl/reset policy isn't supported for compose deploys yet"))
 		return
 	}
 
@@ -224,98 +237,70 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	if buildPack == "" {
 		buildPack = "dockerfile"
 	}
-	description := "yeet: " + name
 
-	switch req.Type {
-	case "github":
-		res, err := s.client.CreatePrivateGithubApp(coolify.PrivateGithubAppRequest{
-			ProjectUUID:         s.cfg.ProjectUUID,
-			ServerUUID:          s.cfg.ServerUUID,
-			EnvironmentName:     s.cfg.EnvironmentName,
-			GithubAppUUID:       s.cfg.GithubAppUUID,
-			GitRepository:       req.Repository,
-			GitBranch:           branch,
-			BuildPack:           buildPack,
-			PortsExposes:        req.Port,
-			Name:                name,
-			Description:         description,
-			Domains:             domain,
-			IsAutoDeployEnabled: true,
-			HealthCheckEnabled:  req.HealthCheckEnabled,
-			HealthCheckPath:     req.HealthCheckPath,
-		})
-		s.finishDeploy(w, res, "application", domain, err, func() error { return s.client.DeployApplication(res.UUID) })
-
-	case "public":
-		res, err := s.client.CreatePublicRepo(coolify.PublicRepoRequest{
-			ProjectUUID:        s.cfg.ProjectUUID,
-			ServerUUID:         s.cfg.ServerUUID,
-			EnvironmentName:    s.cfg.EnvironmentName,
-			GitRepository:      req.Repository,
-			GitBranch:          branch,
-			BuildPack:          buildPack,
-			PortsExposes:       req.Port,
-			Name:               name,
-			Description:        description,
-			Domains:            domain,
-			HealthCheckEnabled: req.HealthCheckEnabled,
-			HealthCheckPath:    req.HealthCheckPath,
-		})
-		s.finishDeploy(w, res, "application", domain, err, func() error { return s.client.DeployApplication(res.UUID) })
-
-	case "dockerfile":
-		res, err := s.client.CreateDockerfile(coolify.DockerfileRequest{
-			ProjectUUID:        s.cfg.ProjectUUID,
-			ServerUUID:         s.cfg.ServerUUID,
-			EnvironmentName:    s.cfg.EnvironmentName,
-			Dockerfile:         req.Dockerfile,
-			BuildPack:          "dockerfile",
-			PortsExposes:       req.Port,
-			Name:               name,
-			Description:        description,
-			Domains:            domain,
-			HealthCheckEnabled: req.HealthCheckEnabled,
-			HealthCheckPath:    req.HealthCheckPath,
-		})
-		// Coolify's dockerfile-create endpoint ignores ports_exposes and
-		// (due to a bug) always falls back to port 80 - patch the real
-		// port in before deploying so the Traefik routing label is right.
-		if err == nil && req.Port != "" {
-			err = s.client.UpdateApplicationPortsExposes(res.UUID, req.Port)
-		}
-		s.finishDeploy(w, res, "application", domain, err, func() error { return s.client.DeployApplication(res.UUID) })
-
-	case "compose":
-		res, err := s.client.CreateService(coolify.ServiceRequest{
-			ProjectUUID:      s.cfg.ProjectUUID,
-			ServerUUID:       s.cfg.ServerUUID,
-			EnvironmentName:  s.cfg.EnvironmentName,
-			Name:             name,
-			Description:      description,
-			DockerComposeRaw: req.Compose,
-			InstantDeploy:    true,
-		})
-		if err != nil {
-			writeErr(w, http.StatusBadGateway, err)
-			return
-		}
-		writeJSON(w, deployResponse{URL: domain, UUID: res.UUID, Kind: "service"})
-
-	default:
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("unknown type %q (want github, public, dockerfile, or compose)", req.Type))
+	spec := coolify.DeploySpec{
+		SourceType:         req.Type,
+		ProjectUUID:        s.cfg.ProjectUUID,
+		ServerUUID:         s.cfg.ServerUUID,
+		EnvironmentName:    s.cfg.EnvironmentName,
+		GithubAppUUID:      s.cfg.GithubAppUUID,
+		GitRepository:      req.Repository,
+		GitBranch:          branch,
+		BuildPack:          buildPack,
+		Dockerfile:         req.Dockerfile,
+		Compose:            req.Compose,
+		PortsExposes:       req.Port,
+		Name:               name,
+		Description:        "yeet: " + name,
+		Domains:            domain,
+		HealthCheckEnabled: req.HealthCheckEnabled,
+		HealthCheckPath:    req.HealthCheckPath,
 	}
-}
 
-func (s *server) finishDeploy(w http.ResponseWriter, res *coolify.CreateResult, kind, domain string, err error, deploy func() error) {
+	result, err := s.client.CreateFromSpec(spec)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
 	}
-	if err := deploy(); err != nil {
-		writeErr(w, http.StatusBadGateway, fmt.Errorf("created but failed to deploy: %w", err))
-		return
+
+	if req.TTLSeconds != nil || req.ResetIntervalSeconds != nil {
+		if err := s.registerPolicy(spec, result, domain, req.TTLSeconds, req.ResetIntervalSeconds, req.ExpiryAction); err != nil {
+			// The deploy itself succeeded - a policy bookkeeping failure
+			// shouldn't fail the whole request, just means no TTL/reset
+			// will be enforced for it. Log so it's not silently lost.
+			log.Printf("register policy for %s: %v", result.UUID, err)
+		}
 	}
-	writeJSON(w, deployResponse{URL: domain, UUID: res.UUID, Kind: kind})
+
+	writeJSON(w, deployResponse{URL: domain, UUID: result.UUID, Kind: result.Kind})
+}
+
+// registerPolicy records a project+instance with TTL/reset policy for a
+// deploy that just succeeded. A no-op if the database isn't available.
+func (s *server) registerPolicy(spec coolify.DeploySpec, result *coolify.DeployResult, domain string, ttl, resetInterval *int64, expiryAction string) error {
+	if s.db == nil {
+		return fmt.Errorf("database not available")
+	}
+	project, err := s.db.CreateProjectWithSpec(store.ProjectSpec{
+		Name:                 spec.Name,
+		SourceType:           spec.SourceType,
+		GitRepository:        spec.GitRepository,
+		GitBranch:            spec.GitBranch,
+		BuildPack:            spec.BuildPack,
+		DockerfileBlob:       spec.Dockerfile,
+		ComposeBlob:          spec.Compose,
+		PortsExposes:         spec.PortsExposes,
+		TTLSeconds:           ttl,
+		ResetIntervalSeconds: resetInterval,
+		ExpiryAction:         expiryAction,
+	})
+	if err != nil {
+		return err
+	}
+	if err := s.db.CreateInstance(project.ID, spec.Name, result.UUID, result.Kind, ttl, resetInterval); err != nil {
+		return err
+	}
+	return s.db.UpdateInstanceObserved(result.UUID, "", domain, time.Now())
 }
 
 func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
@@ -330,15 +315,25 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var policies map[string]store.InstancePolicy
+	if s.db != nil {
+		policies, err = s.db.ListInstancePolicies()
+		if err != nil {
+			log.Printf("list instance policies: %v", err)
+		}
+	}
+
 	type item struct {
-		UUID          string `json:"uuid"`
-		Name          string `json:"name"`
-		Kind          string `json:"kind"`
-		Description   string `json:"description"`
-		URL           string `json:"url,omitempty"`
-		Status        string `json:"status,omitempty"`
-		GitRepository string `json:"git_repository,omitempty"`
-		DashboardURL  string `json:"dashboard_url,omitempty"`
+		UUID          string     `json:"uuid"`
+		Name          string     `json:"name"`
+		Kind          string     `json:"kind"`
+		Description   string     `json:"description"`
+		URL           string     `json:"url,omitempty"`
+		Status        string     `json:"status,omitempty"`
+		GitRepository string     `json:"git_repository,omitempty"`
+		DashboardURL  string     `json:"dashboard_url,omitempty"`
+		ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+		NextResetAt   *time.Time `json:"next_reset_at,omitempty"`
 	}
 	var out []item
 	for _, a := range apps {
@@ -346,6 +341,7 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if strings.HasPrefix(a.Description, "yeet:") {
+			p := policies[a.UUID]
 			out = append(out, item{
 				UUID:          a.UUID,
 				Name:          a.Name,
@@ -355,6 +351,8 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 				Status:        a.Status,
 				GitRepository: displayGitRepository(a.GitRepository),
 				DashboardURL:  s.dashboardLink("application", a.UUID),
+				ExpiresAt:     p.ExpiresAt,
+				NextResetAt:   p.NextResetAt,
 			})
 		}
 	}
@@ -363,6 +361,7 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if strings.HasPrefix(sv.Description, "yeet:") {
+			p := policies[sv.UUID]
 			out = append(out, item{
 				UUID:         sv.UUID,
 				Name:         sv.Name,
@@ -370,6 +369,8 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 				Description:  sv.Description,
 				Status:       sv.Status,
 				DashboardURL: s.dashboardLink("service", sv.UUID),
+				ExpiresAt:    p.ExpiresAt,
+				NextResetAt:  p.NextResetAt,
 			})
 		}
 	}
