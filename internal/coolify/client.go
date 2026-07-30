@@ -5,6 +5,7 @@ package coolify
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -133,6 +134,7 @@ type DockerfileRequest struct {
 }
 
 func (c *Client) CreateDockerfile(req DockerfileRequest) (*CreateResult, error) {
+	req.Dockerfile = base64.StdEncoding.EncodeToString([]byte(req.Dockerfile))
 	var out CreateResult
 	err := c.do(http.MethodPost, "/api/v1/applications/dockerfile", req, &out)
 	return &out, err
@@ -191,6 +193,7 @@ type ServiceCreateResult struct {
 }
 
 func (c *Client) CreateService(req ServiceRequest) (*ServiceCreateResult, error) {
+	req.DockerComposeRaw = base64.StdEncoding.EncodeToString([]byte(req.DockerComposeRaw))
 	var out ServiceCreateResult
 	err := c.do(http.MethodPost, "/api/v1/services", req, &out)
 	return &out, err
