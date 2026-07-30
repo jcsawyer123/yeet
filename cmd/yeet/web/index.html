@@ -100,7 +100,19 @@
     </label>
     <label>Health check path</label>
     <input name="health_check_path" id="health-check-path" placeholder="/healthz" disabled>
-    <p style="font-size:.75rem; color:#888; margin:.4rem 0 0">Not applied to docker-compose deploys.</p>
+
+    <label>Stop after (minutes, optional)</label>
+    <input name="ttl_minutes" placeholder="e.g. 60 for 1 hour">
+
+    <label>Reset every (minutes, optional)</label>
+    <input name="reset_interval_minutes" placeholder="e.g. 1440 for daily">
+
+    <label style="display:flex; align-items:center; gap:.4rem; margin-top:.6rem">
+      <input type="checkbox" name="expiry_delete" id="expiry-delete" style="width:auto">
+      Delete instead of stop when the timer expires
+    </label>
+
+    <p style="font-size:.75rem; color:#888; margin:.4rem 0 0">Health checks and stop/reset timers aren't applied to docker-compose deploys.</p>
   </details>
 
   <div style="margin-top:1rem">
@@ -119,6 +131,7 @@ const typeSel = document.getElementById("type");
 const advanced = document.getElementById("advanced");
 const healthCheckEnabled = document.getElementById("health-check-enabled");
 const healthCheckPath = document.getElementById("health-check-path");
+const policyFields = document.querySelectorAll('[name="ttl_minutes"], [name="reset_interval_minutes"], [name="expiry_delete"]');
 
 function syncPanels() {
   panels.forEach(p => {
@@ -129,11 +142,12 @@ function syncPanels() {
     // silently overwrite the active panel's values on submit.
     p.querySelectorAll("input, textarea").forEach(el => { el.disabled = !active; });
   });
-  // health checks aren't wired up for docker-compose deploys
+  // health checks and stop/reset policy aren't wired up for docker-compose deploys
   const composeSelected = typeSel.value === "compose";
   advanced.toggleAttribute("disabled", composeSelected);
   healthCheckEnabled.disabled = composeSelected;
   healthCheckPath.disabled = composeSelected || !healthCheckEnabled.checked;
+  policyFields.forEach(el => { el.disabled = composeSelected; });
 }
 typeSel.addEventListener("change", syncPanels);
 healthCheckEnabled.addEventListener("change", syncPanels);
@@ -146,6 +160,17 @@ document.getElementById("deploy-form").addEventListener("submit", async (e) => {
   const fd = new FormData(e.target);
   const body = Object.fromEntries(fd.entries());
   body.health_check_enabled = fd.has("health_check_enabled");
+
+  const ttlMinutes = parseInt(body.ttl_minutes, 10);
+  const resetMinutes = parseInt(body.reset_interval_minutes, 10);
+  delete body.ttl_minutes;
+  delete body.reset_interval_minutes;
+  delete body.expiry_delete;
+  if (Number.isFinite(ttlMinutes) && ttlMinutes > 0) body.ttl_seconds = ttlMinutes * 60;
+  if (Number.isFinite(resetMinutes) && resetMinutes > 0) body.reset_interval_seconds = resetMinutes * 60;
+  if (body.ttl_seconds || body.reset_interval_seconds) {
+    body.expiry_action = fd.has("expiry_delete") ? "delete" : "stop";
+  }
 
   btn.disabled = true;
   result.className = "";
@@ -184,6 +209,16 @@ function statusText(status) {
   return health === "unknown" ? state : status;
 }
 
+function relativeMinutes(isoString) {
+  const diffMs = new Date(isoString).getTime() - Date.now();
+  const mins = Math.round(diffMs / 60000);
+  if (mins <= 0) return "any moment";
+  if (mins < 60) return mins + "m";
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + "h " + (mins % 60) + "m";
+  return Math.floor(hours / 24) + "d " + (hours % 24) + "h";
+}
+
 function el(tag, props, ...children) {
   const node = document.createElement(tag);
   Object.entries(props || {}).forEach(([k, v]) => {
@@ -217,6 +252,14 @@ async function loadList() {
     const statusCell = document.createElement("td");
     if (item.status) {
       statusCell.appendChild(el("span", { class: "status-badge " + statusClass(item.status), text: statusText(item.status) }));
+    }
+    if (item.expires_at) {
+      statusCell.appendChild(document.createTextNode(" "));
+      statusCell.appendChild(el("span", { class: "status-badge status-other", text: "stops in " + relativeMinutes(item.expires_at) }));
+    }
+    if (item.next_reset_at) {
+      statusCell.appendChild(document.createTextNode(" "));
+      statusCell.appendChild(el("span", { class: "status-badge status-other", text: "resets in " + relativeMinutes(item.next_reset_at) }));
     }
 
     const actionsCell = el("td", { class: "row-actions" },
