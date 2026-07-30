@@ -87,6 +87,8 @@ type PrivateGithubAppRequest struct {
 	Description         string `json:"description,omitempty"`
 	Domains             string `json:"domains,omitempty"`
 	IsAutoDeployEnabled bool   `json:"is_auto_deploy_enabled"`
+	HealthCheckEnabled  bool   `json:"health_check_enabled,omitempty"`
+	HealthCheckPath     string `json:"health_check_path,omitempty"`
 }
 
 func (c *Client) CreatePrivateGithubApp(req PrivateGithubAppRequest) (*CreateResult, error) {
@@ -96,16 +98,18 @@ func (c *Client) CreatePrivateGithubApp(req PrivateGithubAppRequest) (*CreateRes
 }
 
 type PublicRepoRequest struct {
-	ProjectUUID     string `json:"project_uuid"`
-	ServerUUID      string `json:"server_uuid"`
-	EnvironmentName string `json:"environment_name"`
-	GitRepository   string `json:"git_repository"`
-	GitBranch       string `json:"git_branch"`
-	BuildPack       string `json:"build_pack"`
-	PortsExposes    string `json:"ports_exposes,omitempty"`
-	Name            string `json:"name,omitempty"`
-	Description     string `json:"description,omitempty"`
-	Domains         string `json:"domains,omitempty"`
+	ProjectUUID        string `json:"project_uuid"`
+	ServerUUID         string `json:"server_uuid"`
+	EnvironmentName    string `json:"environment_name"`
+	GitRepository      string `json:"git_repository"`
+	GitBranch          string `json:"git_branch"`
+	BuildPack          string `json:"build_pack"`
+	PortsExposes       string `json:"ports_exposes,omitempty"`
+	Name               string `json:"name,omitempty"`
+	Description        string `json:"description,omitempty"`
+	Domains            string `json:"domains,omitempty"`
+	HealthCheckEnabled bool   `json:"health_check_enabled,omitempty"`
+	HealthCheckPath    string `json:"health_check_path,omitempty"`
 }
 
 func (c *Client) CreatePublicRepo(req PublicRepoRequest) (*CreateResult, error) {
@@ -115,15 +119,17 @@ func (c *Client) CreatePublicRepo(req PublicRepoRequest) (*CreateResult, error) 
 }
 
 type DockerfileRequest struct {
-	ProjectUUID     string `json:"project_uuid"`
-	ServerUUID      string `json:"server_uuid"`
-	EnvironmentName string `json:"environment_name"`
-	Dockerfile      string `json:"dockerfile"`
-	BuildPack       string `json:"build_pack"`
-	PortsExposes    string `json:"ports_exposes,omitempty"`
-	Name            string `json:"name,omitempty"`
-	Description     string `json:"description,omitempty"`
-	Domains         string `json:"domains,omitempty"`
+	ProjectUUID        string `json:"project_uuid"`
+	ServerUUID         string `json:"server_uuid"`
+	EnvironmentName    string `json:"environment_name"`
+	Dockerfile         string `json:"dockerfile"`
+	BuildPack          string `json:"build_pack"`
+	PortsExposes       string `json:"ports_exposes,omitempty"`
+	Name               string `json:"name,omitempty"`
+	Description        string `json:"description,omitempty"`
+	Domains            string `json:"domains,omitempty"`
+	HealthCheckEnabled bool   `json:"health_check_enabled,omitempty"`
+	HealthCheckPath    string `json:"health_check_path,omitempty"`
 }
 
 func (c *Client) CreateDockerfile(req DockerfileRequest) (*CreateResult, error) {
