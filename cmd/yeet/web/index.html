@@ -6,14 +6,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>yeet</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root { color-scheme: light dark; --field-bg: #fff; --field-fg: #111; }
+  @media (prefers-color-scheme: dark) { :root { --field-bg: #1c1c1c; --field-fg: #eee; } }
   body { font: 15px/1.5 -apple-system, system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1.25rem; }
   h1 { font-size: 1.4rem; margin-bottom: 0; }
   .sub { color: #888; margin-top: .15rem; margin-bottom: 2rem; }
   fieldset { border: 1px solid #8883; border-radius: 6px; padding: 1rem; margin-bottom: 1.5rem; }
   legend { padding: 0 .4rem; }
   label { display: block; font-size: .85rem; margin: .6rem 0 .2rem; }
-  input, select, textarea { width: 100%; box-sizing: border-box; padding: .5rem; font: inherit; border: 1px solid #8886; border-radius: 4px; background: transparent; color: inherit; }
+  input, select, textarea { width: 100%; box-sizing: border-box; padding: .5rem; font: inherit; border: 1px solid #8886; border-radius: 4px; background: var(--field-bg); color: var(--field-fg); }
+  select option { background: var(--field-bg); color: var(--field-fg); }
   textarea { min-height: 8rem; font-family: ui-monospace, monospace; font-size: .85rem; }
   button { padding: .55rem 1.1rem; font: inherit; border: none; border-radius: 4px; background: #2563eb; color: #fff; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
