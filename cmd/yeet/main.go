@@ -156,14 +156,16 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 type deployRequest struct {
-	Type       string `json:"type"` // "github" | "public" | "dockerfile" | "compose"
-	Repository string `json:"repository,omitempty"`
-	Branch     string `json:"branch,omitempty"`
-	Port       string `json:"port,omitempty"`
-	Dockerfile string `json:"dockerfile,omitempty"`
-	Compose    string `json:"compose,omitempty"`
-	Name       string `json:"name,omitempty"`
-	BuildPack  string `json:"build_pack,omitempty"` // for github/public: nixpacks|dockerfile|dockercompose
+	Type               string `json:"type"` // "github" | "public" | "dockerfile" | "compose"
+	Repository         string `json:"repository,omitempty"`
+	Branch             string `json:"branch,omitempty"`
+	Port               string `json:"port,omitempty"`
+	Dockerfile         string `json:"dockerfile,omitempty"`
+	Compose            string `json:"compose,omitempty"`
+	Name               string `json:"name,omitempty"`
+	BuildPack          string `json:"build_pack,omitempty"` // for github/public: nixpacks|dockerfile|dockercompose
+	HealthCheckEnabled bool   `json:"health_check_enabled,omitempty"`
+	HealthCheckPath    string `json:"health_check_path,omitempty"`
 }
 
 type deployResponse struct {
@@ -209,35 +211,41 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 			Description:         description,
 			Domains:             domain,
 			IsAutoDeployEnabled: true,
+			HealthCheckEnabled:  req.HealthCheckEnabled,
+			HealthCheckPath:     req.HealthCheckPath,
 		})
 		s.finishDeploy(w, res, "application", domain, err, func() error { return s.client.DeployApplication(res.UUID) })
 
 	case "public":
 		res, err := s.client.CreatePublicRepo(coolify.PublicRepoRequest{
-			ProjectUUID:     s.cfg.ProjectUUID,
-			ServerUUID:      s.cfg.ServerUUID,
-			EnvironmentName: s.cfg.EnvironmentName,
-			GitRepository:   req.Repository,
-			GitBranch:       branch,
-			BuildPack:       buildPack,
-			PortsExposes:    req.Port,
-			Name:            name,
-			Description:     description,
-			Domains:         domain,
+			ProjectUUID:        s.cfg.ProjectUUID,
+			ServerUUID:         s.cfg.ServerUUID,
+			EnvironmentName:    s.cfg.EnvironmentName,
+			GitRepository:      req.Repository,
+			GitBranch:          branch,
+			BuildPack:          buildPack,
+			PortsExposes:       req.Port,
+			Name:               name,
+			Description:        description,
+			Domains:            domain,
+			HealthCheckEnabled: req.HealthCheckEnabled,
+			HealthCheckPath:    req.HealthCheckPath,
 		})
 		s.finishDeploy(w, res, "application", domain, err, func() error { return s.client.DeployApplication(res.UUID) })
 
 	case "dockerfile":
 		res, err := s.client.CreateDockerfile(coolify.DockerfileRequest{
-			ProjectUUID:     s.cfg.ProjectUUID,
-			ServerUUID:      s.cfg.ServerUUID,
-			EnvironmentName: s.cfg.EnvironmentName,
-			Dockerfile:      req.Dockerfile,
-			BuildPack:       "dockerfile",
-			PortsExposes:    req.Port,
-			Name:            name,
-			Description:     description,
-			Domains:         domain,
+			ProjectUUID:        s.cfg.ProjectUUID,
+			ServerUUID:         s.cfg.ServerUUID,
+			EnvironmentName:    s.cfg.EnvironmentName,
+			Dockerfile:         req.Dockerfile,
+			BuildPack:          "dockerfile",
+			PortsExposes:       req.Port,
+			Name:               name,
+			Description:        description,
+			Domains:            domain,
+			HealthCheckEnabled: req.HealthCheckEnabled,
+			HealthCheckPath:    req.HealthCheckPath,
 		})
 		s.finishDeploy(w, res, "application", domain, err, func() error { return s.client.DeployApplication(res.UUID) })
 
