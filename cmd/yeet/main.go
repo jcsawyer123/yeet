@@ -36,6 +36,7 @@ type config struct {
 	ListenAddr      string
 	SelfUUID        string
 	DBPath          string
+	AdminHost       string
 }
 
 func loadConfig() config {
@@ -58,6 +59,12 @@ func loadConfig() config {
 		// otherwise every redeploy wipes yeet's local state. Defaults to a
 		// relative path for local dev, where that doesn't matter.
 		DBPath: envOr("YEET_DB_PATH", "yeet.db"),
+		// Only this host gets the admin surface (deploy/stop/start/delete,
+		// the dashboard UI). Every other host - including yeet's own
+		// public domain - only gets the narrow public API. Default-deny,
+		// not default-allow: an unrecognised or spoofed Host header never
+		// gets admin access.
+		AdminHost: envOr("YEET_ADMIN_HOST", "yeet.home.jcsx.me"),
 	}
 	if cfg.EnvironmentName == "" {
 		cfg.EnvironmentName = "production"
@@ -143,7 +150,30 @@ func main() {
 	})
 
 	log.Printf("yeet listening on %s", cfg.ListenAddr)
-	log.Fatal(http.ListenAndServe(cfg.ListenAddr, mux))
+	log.Fatal(http.ListenAndServe(cfg.ListenAddr, hostGate(cfg.AdminHost, mux)))
+}
+
+// hostGate restricts the admin surface (dashboard, deploy, stop/start/
+// delete) to requests arriving on AdminHost. Every other Host - including
+// yeet's own public domain, which the apps it deploys need to reach -
+// only gets the narrow public API and the /go/ wake-and-redirect path.
+// Default deny: an unrecognised Host gets the public surface, not admin.
+func hostGate(adminHost string, admin http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if i := strings.IndexByte(host, ':'); i >= 0 {
+			host = host[:i]
+		}
+		if host == adminHost {
+			admin.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/healthz" || strings.HasPrefix(r.URL.Path, "/api/v1/public/") || strings.HasPrefix(r.URL.Path, "/go/") {
+			admin.ServeHTTP(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
 }
 
 // resolveEnvironmentUUID looks up the environment's uuid once at startup.
