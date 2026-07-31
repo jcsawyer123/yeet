@@ -90,6 +90,7 @@ type PrivateGithubAppRequest struct {
 	IsAutoDeployEnabled bool   `json:"is_auto_deploy_enabled"`
 	HealthCheckEnabled  bool   `json:"health_check_enabled,omitempty"`
 	HealthCheckPath     string `json:"health_check_path,omitempty"`
+	ForceDomainOverride bool   `json:"force_domain_override,omitempty"`
 }
 
 func (c *Client) CreatePrivateGithubApp(req PrivateGithubAppRequest) (*CreateResult, error) {
@@ -99,18 +100,19 @@ func (c *Client) CreatePrivateGithubApp(req PrivateGithubAppRequest) (*CreateRes
 }
 
 type PublicRepoRequest struct {
-	ProjectUUID        string `json:"project_uuid"`
-	ServerUUID         string `json:"server_uuid"`
-	EnvironmentName    string `json:"environment_name"`
-	GitRepository      string `json:"git_repository"`
-	GitBranch          string `json:"git_branch"`
-	BuildPack          string `json:"build_pack"`
-	PortsExposes       string `json:"ports_exposes,omitempty"`
-	Name               string `json:"name,omitempty"`
-	Description        string `json:"description,omitempty"`
-	Domains            string `json:"domains,omitempty"`
-	HealthCheckEnabled bool   `json:"health_check_enabled,omitempty"`
-	HealthCheckPath    string `json:"health_check_path,omitempty"`
+	ProjectUUID         string `json:"project_uuid"`
+	ServerUUID          string `json:"server_uuid"`
+	EnvironmentName     string `json:"environment_name"`
+	GitRepository       string `json:"git_repository"`
+	GitBranch           string `json:"git_branch"`
+	BuildPack           string `json:"build_pack"`
+	PortsExposes        string `json:"ports_exposes,omitempty"`
+	Name                string `json:"name,omitempty"`
+	Description         string `json:"description,omitempty"`
+	Domains             string `json:"domains,omitempty"`
+	HealthCheckEnabled  bool   `json:"health_check_enabled,omitempty"`
+	HealthCheckPath     string `json:"health_check_path,omitempty"`
+	ForceDomainOverride bool   `json:"force_domain_override,omitempty"`
 }
 
 func (c *Client) CreatePublicRepo(req PublicRepoRequest) (*CreateResult, error) {
@@ -120,17 +122,18 @@ func (c *Client) CreatePublicRepo(req PublicRepoRequest) (*CreateResult, error) 
 }
 
 type DockerfileRequest struct {
-	ProjectUUID        string `json:"project_uuid"`
-	ServerUUID         string `json:"server_uuid"`
-	EnvironmentName    string `json:"environment_name"`
-	Dockerfile         string `json:"dockerfile"`
-	BuildPack          string `json:"build_pack"`
-	PortsExposes       string `json:"ports_exposes,omitempty"`
-	Name               string `json:"name,omitempty"`
-	Description        string `json:"description,omitempty"`
-	Domains            string `json:"domains,omitempty"`
-	HealthCheckEnabled bool   `json:"health_check_enabled,omitempty"`
-	HealthCheckPath    string `json:"health_check_path,omitempty"`
+	ProjectUUID         string `json:"project_uuid"`
+	ServerUUID          string `json:"server_uuid"`
+	EnvironmentName     string `json:"environment_name"`
+	Dockerfile          string `json:"dockerfile"`
+	BuildPack           string `json:"build_pack"`
+	PortsExposes        string `json:"ports_exposes,omitempty"`
+	Name                string `json:"name,omitempty"`
+	Description         string `json:"description,omitempty"`
+	Domains             string `json:"domains,omitempty"`
+	HealthCheckEnabled  bool   `json:"health_check_enabled,omitempty"`
+	HealthCheckPath     string `json:"health_check_path,omitempty"`
+	ForceDomainOverride bool   `json:"force_domain_override,omitempty"`
 }
 
 func (c *Client) CreateDockerfile(req DockerfileRequest) (*CreateResult, error) {
@@ -274,6 +277,11 @@ type DeploySpec struct {
 	Domains            string
 	HealthCheckEnabled bool
 	HealthCheckPath    string
+	// ForceDomainOverride should only be set by the reset-recreate path -
+	// it deliberately bypasses Coolify's domain-uniqueness check, which
+	// otherwise 409s in a real race: a resource we just deleted ourselves
+	// can still be reported as holding the domain for a moment afterward.
+	ForceDomainOverride bool
 }
 
 type DeployResult struct {
@@ -299,6 +307,7 @@ func (c *Client) CreateFromSpec(spec DeploySpec) (*DeployResult, error) {
 			IsAutoDeployEnabled: true,
 			HealthCheckEnabled:  spec.HealthCheckEnabled,
 			HealthCheckPath:     spec.HealthCheckPath,
+			ForceDomainOverride: spec.ForceDomainOverride,
 		})
 		if err != nil {
 			return nil, err
@@ -307,18 +316,19 @@ func (c *Client) CreateFromSpec(spec DeploySpec) (*DeployResult, error) {
 
 	case "public":
 		res, err := c.CreatePublicRepo(PublicRepoRequest{
-			ProjectUUID:        spec.ProjectUUID,
-			ServerUUID:         spec.ServerUUID,
-			EnvironmentName:    spec.EnvironmentName,
-			GitRepository:      spec.GitRepository,
-			GitBranch:          spec.GitBranch,
-			BuildPack:          spec.BuildPack,
-			PortsExposes:       spec.PortsExposes,
-			Name:               spec.Name,
-			Description:        spec.Description,
-			Domains:            spec.Domains,
-			HealthCheckEnabled: spec.HealthCheckEnabled,
-			HealthCheckPath:    spec.HealthCheckPath,
+			ProjectUUID:         spec.ProjectUUID,
+			ServerUUID:          spec.ServerUUID,
+			EnvironmentName:     spec.EnvironmentName,
+			GitRepository:       spec.GitRepository,
+			GitBranch:           spec.GitBranch,
+			BuildPack:           spec.BuildPack,
+			PortsExposes:        spec.PortsExposes,
+			Name:                spec.Name,
+			Description:         spec.Description,
+			Domains:             spec.Domains,
+			HealthCheckEnabled:  spec.HealthCheckEnabled,
+			HealthCheckPath:     spec.HealthCheckPath,
+			ForceDomainOverride: spec.ForceDomainOverride,
 		})
 		if err != nil {
 			return nil, err
@@ -327,17 +337,18 @@ func (c *Client) CreateFromSpec(spec DeploySpec) (*DeployResult, error) {
 
 	case "dockerfile":
 		res, err := c.CreateDockerfile(DockerfileRequest{
-			ProjectUUID:        spec.ProjectUUID,
-			ServerUUID:         spec.ServerUUID,
-			EnvironmentName:    spec.EnvironmentName,
-			Dockerfile:         spec.Dockerfile,
-			BuildPack:          "dockerfile",
-			PortsExposes:       spec.PortsExposes,
-			Name:               spec.Name,
-			Description:        spec.Description,
-			Domains:            spec.Domains,
-			HealthCheckEnabled: spec.HealthCheckEnabled,
-			HealthCheckPath:    spec.HealthCheckPath,
+			ProjectUUID:         spec.ProjectUUID,
+			ServerUUID:          spec.ServerUUID,
+			EnvironmentName:     spec.EnvironmentName,
+			Dockerfile:          spec.Dockerfile,
+			BuildPack:           "dockerfile",
+			PortsExposes:        spec.PortsExposes,
+			Name:                spec.Name,
+			Description:         spec.Description,
+			Domains:             spec.Domains,
+			HealthCheckEnabled:  spec.HealthCheckEnabled,
+			HealthCheckPath:     spec.HealthCheckPath,
+			ForceDomainOverride: spec.ForceDomainOverride,
 		})
 		if err != nil {
 			return nil, err

@@ -216,6 +216,10 @@ func (r *Reconciler) enforceReset(e store.EnforceableInstance) {
 		Name:            e.Spec.Name,
 		Description:     "yeet: " + e.Spec.Name,
 		Domains:         e.FQDN,
+		// The old resource holding this domain was just deleted by us,
+		// above - Coolify's domain-uniqueness check can lag behind that
+		// deletion by a moment and 409 otherwise (observed in testing).
+		ForceDomainOverride: true,
 	})
 	if err != nil {
 		log.Printf("reconcile: reset recreate for project %d: %v", e.ProjectID, err)
