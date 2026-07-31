@@ -220,6 +220,7 @@ func (r *Reconciler) enforceReset(e store.EnforceableInstance) {
 		// above - Coolify's domain-uniqueness check can lag behind that
 		// deletion by a moment and 409 otherwise (observed in testing).
 		ForceDomainOverride: true,
+		Envs:                coolify.ParseEnvBlob(e.Spec.EnvsBlob),
 	})
 	if err != nil {
 		log.Printf("reconcile: reset recreate for project %d: %v", e.ProjectID, err)
