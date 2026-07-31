@@ -1,0 +1,1 @@
+ALTER TABLE project ADD COLUMN envs_blob TEXT NOT NULL DEFAULT '';

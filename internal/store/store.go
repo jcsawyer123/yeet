@@ -116,6 +116,7 @@ type ProjectSpec struct {
 	ResetIntervalSeconds *int64
 	ExpiryAction         string // "stop" | "delete"
 	DomainPattern        string // "" means the default {id}.<first allowed base>
+	EnvsBlob             string // raw .env-style text; parse with coolify.ParseEnvBlob
 }
 
 // CreateProjectWithSpec registers a new project with its source spec and
@@ -131,11 +132,11 @@ func (db *DB) CreateProjectWithSpec(spec ProjectSpec) (*Project, error) {
 		INSERT INTO project (
 			slug, name, kind, source_type, git_repository, git_branch, build_pack,
 			dockerfile_blob, compose_blob, ports_exposes, ttl_seconds,
-			reset_interval_seconds, expiry_action, domain_pattern, created_at, updated_at
-		) VALUES (?, ?, 'adhoc', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			reset_interval_seconds, expiry_action, domain_pattern, envs_blob, created_at, updated_at
+		) VALUES (?, ?, 'adhoc', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		spec.Name, spec.Name, spec.SourceType, spec.GitRepository, spec.GitBranch, spec.BuildPack,
 		spec.DockerfileBlob, spec.ComposeBlob, spec.PortsExposes, spec.TTLSeconds,
-		spec.ResetIntervalSeconds, expiryAction, spec.DomainPattern, now, now)
+		spec.ResetIntervalSeconds, expiryAction, spec.DomainPattern, spec.EnvsBlob, now, now)
 	if err != nil {
 		return nil, fmt.Errorf("create project %q: %w", spec.Name, err)
 	}
@@ -197,7 +198,7 @@ func (db *DB) ListEnforceable() ([]EnforceableInstance, error) {
 	rows, err := db.sql.Query(`
 		SELECT i.id, i.project_id, i.coolify_uuid, i.coolify_kind, i.fqdn, i.expires_at, i.next_reset_at,
 		       p.expiry_action, p.reset_interval_seconds, p.name, p.source_type, p.git_repository,
-		       p.git_branch, p.build_pack, p.dockerfile_blob, p.compose_blob, p.ports_exposes
+		       p.git_branch, p.build_pack, p.dockerfile_blob, p.compose_blob, p.ports_exposes, p.envs_blob
 		FROM instance i
 		JOIN project p ON p.id = i.project_id
 		WHERE i.deleted_at IS NULL
@@ -215,7 +216,7 @@ func (db *DB) ListEnforceable() ([]EnforceableInstance, error) {
 		if err := rows.Scan(
 			&e.InstanceID, &e.ProjectID, &e.CoolifyUUID, &e.CoolifyKind, &fqdn, &expiresAt, &nextResetAt,
 			&e.ExpiryAction, &resetIntervalSeconds, &e.Spec.Name, &e.Spec.SourceType, &e.Spec.GitRepository,
-			&e.Spec.GitBranch, &e.Spec.BuildPack, &e.Spec.DockerfileBlob, &e.Spec.ComposeBlob, &e.Spec.PortsExposes,
+			&e.Spec.GitBranch, &e.Spec.BuildPack, &e.Spec.DockerfileBlob, &e.Spec.ComposeBlob, &e.Spec.PortsExposes, &e.Spec.EnvsBlob,
 		); err != nil {
 			return nil, fmt.Errorf("scan enforceable instance: %w", err)
 		}
@@ -321,10 +322,10 @@ func (db *DB) GetProjectBySlug(slug string) (*Project, ProjectSpec, error) {
 	var spec ProjectSpec
 	err := db.sql.QueryRow(`
 		SELECT id, slug, name, kind, source_type, git_repository, git_branch,
-		       build_pack, dockerfile_blob, compose_blob, ports_exposes, domain_pattern
+		       build_pack, dockerfile_blob, compose_blob, ports_exposes, domain_pattern, envs_blob
 		FROM project WHERE slug = ?`, slug).
 		Scan(&p.ID, &p.Slug, &p.Name, &p.Kind, &spec.SourceType, &spec.GitRepository, &spec.GitBranch,
-			&spec.BuildPack, &spec.DockerfileBlob, &spec.ComposeBlob, &spec.PortsExposes, &spec.DomainPattern)
+			&spec.BuildPack, &spec.DockerfileBlob, &spec.ComposeBlob, &spec.PortsExposes, &spec.DomainPattern, &spec.EnvsBlob)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ProjectSpec{}, nil
 	}
