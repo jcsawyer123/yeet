@@ -134,7 +134,11 @@
     <input name="domain_pattern" id="domain-pattern" placeholder="{{"{{id}}"}}.{{.BaseDomain}}">
     <p style="font-size:.8rem; color:#888; margin:.3rem 0 0">Preview: <span id="domain-preview">yeet-abc123.{{.BaseDomain}}</span></p>
 
-    <p style="font-size:.75rem; color:#888; margin:1rem 0 0">Health checks and stop/reset timers aren't applied to docker-compose deploys.</p>
+    <div class="field-group-label">Environment variables</div>
+    <label>One per line, KEY=VALUE (optional)</label>
+    <textarea name="envs" id="envs" placeholder="API_KEY=abc123&#10;DEBUG=true" style="min-height:5rem; font-family:ui-monospace, monospace; font-size:.85rem"></textarea>
+
+    <p style="font-size:.75rem; color:#888; margin:1rem 0 0">Health checks, stop/reset timers, and env vars aren't applied to docker-compose deploys - use the compose file itself for those.</p>
   </details>
 
   <div style="margin-top:1rem">
@@ -157,7 +161,7 @@ const typeSel = document.getElementById("type");
 const advanced = document.getElementById("advanced");
 const healthCheckEnabled = document.getElementById("health-check-enabled");
 const healthCheckPath = document.getElementById("health-check-path");
-const policyFields = document.querySelectorAll('[name="ttl_minutes"], [name="reset_interval_minutes"], [name="expiry_delete"], [name="domain_pattern"]');
+const policyFields = document.querySelectorAll('[name="ttl_minutes"], [name="reset_interval_minutes"], [name="expiry_delete"], [name="domain_pattern"], [name="envs"]');
 const domainPatternInput = document.getElementById("domain-pattern");
 const domainPreview = document.getElementById("domain-preview");
 const baseDomain = {{.BaseDomain}};
