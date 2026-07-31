@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jcsawyer123/yeet/internal/coolify"
+	"github.com/jcsawyer123/yeet/internal/domainpattern"
 	"github.com/jcsawyer123/yeet/internal/ratelimit"
 	"github.com/jcsawyer123/yeet/internal/reconcile"
 	"github.com/jcsawyer123/yeet/internal/store"
@@ -29,18 +30,19 @@ import (
 var webFS embed.FS
 
 type config struct {
-	CoolifyBaseURL  string
-	CoolifyToken    string
-	ProjectUUID     string
-	ServerUUID      string
-	EnvironmentName string
-	GithubAppUUID   string
-	BaseDomain      string
-	DashboardURL    string
-	ListenAddr      string
-	SelfUUID        string
-	DBPath          string
-	AdminHost       string
+	CoolifyBaseURL     string
+	CoolifyToken       string
+	ProjectUUID        string
+	ServerUUID         string
+	EnvironmentName    string
+	GithubAppUUID      string
+	BaseDomain         string
+	DashboardURL       string
+	ListenAddr         string
+	SelfUUID           string
+	DBPath             string
+	AdminHost          string
+	AllowedBaseDomains []string
 }
 
 func loadConfig() config {
@@ -72,6 +74,21 @@ func loadConfig() config {
 	}
 	if cfg.EnvironmentName == "" {
 		cfg.EnvironmentName = "production"
+	}
+	// A custom domain pattern must resolve one label under one of these.
+	// Defaults to just BASE_DOMAIN, which reproduces the original fixed
+	// naming scheme exactly with zero config. Adding a second base domain
+	// (e.g. a dedicated "run.jcsx.me" zone) is a config-only change here -
+	// it needs its own DNS/Caddy/cert setup first, but yeet's own code
+	// doesn't change to support it.
+	if raw := os.Getenv("YEET_ALLOWED_BASE_DOMAINS"); raw != "" {
+		for _, b := range strings.Split(raw, ",") {
+			if b = strings.TrimSpace(b); b != "" {
+				cfg.AllowedBaseDomains = append(cfg.AllowedBaseDomains, b)
+			}
+		}
+	} else if cfg.BaseDomain != "" {
+		cfg.AllowedBaseDomains = []string{cfg.BaseDomain}
 	}
 	missing := []string{}
 	for name, val := range map[string]string{
@@ -248,6 +265,10 @@ type deployRequest struct {
 	TTLSeconds           *int64 `json:"ttl_seconds,omitempty"`
 	ResetIntervalSeconds *int64 `json:"reset_interval_seconds,omitempty"`
 	ExpiryAction         string `json:"expiry_action,omitempty"` // "stop" | "delete", default "stop"
+	// DomainPattern is a template like "service-{id}.dev.jcsx.me"; "" uses
+	// the original fixed scheme ({id}.<BASE_DOMAIN>). Must resolve to
+	// exactly one label under an allowed base domain - see domainpattern.
+	DomainPattern string `json:"domain_pattern,omitempty"`
 }
 
 type deployResponse struct {
@@ -271,7 +292,12 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = coolify.RandomName()
 	}
-	domain := "https://" + name + "." + s.cfg.BaseDomain
+	host, err := domainpattern.Resolve(req.DomainPattern, name, s.cfg.AllowedBaseDomains)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	domain := "https://" + host
 	branch := req.Branch
 	if branch == "" {
 		branch = "main"
@@ -306,8 +332,11 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.TTLSeconds != nil || req.ResetIntervalSeconds != nil {
-		if err := s.registerPolicy(spec, result, domain, req.TTLSeconds, req.ResetIntervalSeconds, req.ExpiryAction); err != nil {
+	// A project row is worth creating even without TTL/reset policy when a
+	// custom domain pattern was requested, so wake (Phase 3) can later
+	// re-resolve the same pattern rather than falling back to the default.
+	if req.TTLSeconds != nil || req.ResetIntervalSeconds != nil || req.DomainPattern != "" {
+		if err := s.registerPolicy(spec, result, domain, req.TTLSeconds, req.ResetIntervalSeconds, req.ExpiryAction, req.DomainPattern); err != nil {
 			// The deploy itself succeeded - a policy bookkeeping failure
 			// shouldn't fail the whole request, just means no TTL/reset
 			// will be enforced for it. Log so it's not silently lost.
@@ -318,9 +347,10 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, deployResponse{URL: domain, UUID: result.UUID, Kind: result.Kind})
 }
 
-// registerPolicy records a project+instance with TTL/reset policy for a
-// deploy that just succeeded. A no-op if the database isn't available.
-func (s *server) registerPolicy(spec coolify.DeploySpec, result *coolify.DeployResult, domain string, ttl, resetInterval *int64, expiryAction string) error {
+// registerPolicy records a project+instance with TTL/reset policy and/or
+// domain pattern for a deploy that just succeeded. A no-op if the
+// database isn't available.
+func (s *server) registerPolicy(spec coolify.DeploySpec, result *coolify.DeployResult, domain string, ttl, resetInterval *int64, expiryAction, domainPattern string) error {
 	if s.db == nil {
 		return fmt.Errorf("database not available")
 	}
@@ -336,6 +366,7 @@ func (s *server) registerPolicy(spec coolify.DeploySpec, result *coolify.DeployR
 		TTLSeconds:           ttl,
 		ResetIntervalSeconds: resetInterval,
 		ExpiryAction:         expiryAction,
+		DomainPattern:        domainPattern,
 	})
 	if err != nil {
 		return err
@@ -590,7 +621,11 @@ func (s *server) wakeProject(project *store.Project, slug string) (wakeStatus, e
 		if err != nil {
 			return wakeStatus{}, err
 		}
-		domain := "https://" + slug + "." + s.cfg.BaseDomain
+		host, err := domainpattern.Resolve(spec.DomainPattern, slug, s.cfg.AllowedBaseDomains)
+		if err != nil {
+			return wakeStatus{}, err
+		}
+		domain := "https://" + host
 		result, err := s.client.CreateFromSpec(coolify.DeploySpec{
 			SourceType:      spec.SourceType,
 			ProjectUUID:     s.cfg.ProjectUUID,
