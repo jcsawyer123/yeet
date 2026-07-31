@@ -270,7 +270,11 @@ type deployRequest struct {
 	// type, and services don't need it as urgently as ad-hoc apps do.
 	TTLSeconds           *int64 `json:"ttl_seconds,omitempty"`
 	ResetIntervalSeconds *int64 `json:"reset_interval_seconds,omitempty"`
-	ExpiryAction         string `json:"expiry_action,omitempty"` // "stop" | "delete", default "stop"
+	// IdleTimeoutSeconds is a rolling deadline, pushed forward on every
+	// wake/status hit (see renewIdleExpiry) - "idle" means nobody's asked
+	// about this instance in this many seconds, not any real usage signal.
+	IdleTimeoutSeconds *int64 `json:"idle_timeout_seconds,omitempty"`
+	ExpiryAction       string `json:"expiry_action,omitempty"` // "stop" | "delete", default "stop"
 	// DomainPattern is a template like "service-{id}.dev.jcsx.me"; "" uses
 	// the original fixed scheme ({id}.<BASE_DOMAIN>). Must resolve to
 	// exactly one label under an allowed base domain - see domainpattern.
@@ -292,8 +296,8 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.Type == "compose" && (req.TTLSeconds != nil || req.ResetIntervalSeconds != nil) {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("ttl/reset policy isn't supported for compose deploys yet"))
+	if req.Type == "compose" && (req.TTLSeconds != nil || req.ResetIntervalSeconds != nil || req.IdleTimeoutSeconds != nil) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("ttl/reset/idle-timeout policy isn't supported for compose deploys yet"))
 		return
 	}
 	if req.Type == "compose" && req.Envs != "" {
@@ -349,8 +353,8 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	// A project row is worth creating even without TTL/reset policy when a
 	// custom domain pattern or env vars were requested, so wake (Phase 3)
 	// and reset can later reuse them rather than falling back to defaults.
-	if req.TTLSeconds != nil || req.ResetIntervalSeconds != nil || req.DomainPattern != "" || req.Envs != "" {
-		if err := s.registerPolicy(spec, result, domain, req.TTLSeconds, req.ResetIntervalSeconds, req.ExpiryAction, req.DomainPattern, req.Envs); err != nil {
+	if req.TTLSeconds != nil || req.ResetIntervalSeconds != nil || req.IdleTimeoutSeconds != nil || req.DomainPattern != "" || req.Envs != "" {
+		if err := s.registerPolicy(spec, result, domain, req.TTLSeconds, req.ResetIntervalSeconds, req.IdleTimeoutSeconds, req.ExpiryAction, req.DomainPattern, req.Envs); err != nil {
 			// The deploy itself succeeded - a policy bookkeeping failure
 			// shouldn't fail the whole request, just means no TTL/reset
 			// will be enforced for it. Log so it's not silently lost.
@@ -364,7 +368,7 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 // registerPolicy records a project+instance with TTL/reset policy and/or
 // domain pattern for a deploy that just succeeded. A no-op if the
 // database isn't available.
-func (s *server) registerPolicy(spec coolify.DeploySpec, result *coolify.DeployResult, domain string, ttl, resetInterval *int64, expiryAction, domainPattern, envsBlob string) error {
+func (s *server) registerPolicy(spec coolify.DeploySpec, result *coolify.DeployResult, domain string, ttl, resetInterval, idleTimeout *int64, expiryAction, domainPattern, envsBlob string) error {
 	if s.db == nil {
 		return fmt.Errorf("database not available")
 	}
@@ -379,6 +383,7 @@ func (s *server) registerPolicy(spec coolify.DeploySpec, result *coolify.DeployR
 		PortsExposes:         spec.PortsExposes,
 		TTLSeconds:           ttl,
 		ResetIntervalSeconds: resetInterval,
+		IdleTimeoutSeconds:   idleTimeout,
 		ExpiryAction:         expiryAction,
 		DomainPattern:        domainPattern,
 		EnvsBlob:             envsBlob,
@@ -386,7 +391,7 @@ func (s *server) registerPolicy(spec coolify.DeploySpec, result *coolify.DeployR
 	if err != nil {
 		return err
 	}
-	if err := s.db.CreateInstance(project.ID, spec.Name, result.UUID, result.Kind, ttl, resetInterval); err != nil {
+	if err := s.db.CreateInstance(project.ID, spec.Name, result.UUID, result.Kind, ttl, resetInterval, idleTimeout); err != nil {
 		return err
 	}
 	return s.db.UpdateInstanceObserved(result.UUID, "", domain, time.Now())
@@ -423,6 +428,7 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 		DashboardURL  string     `json:"dashboard_url,omitempty"`
 		ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 		NextResetAt   *time.Time `json:"next_reset_at,omitempty"`
+		IdleExpiresAt *time.Time `json:"idle_expires_at,omitempty"`
 	}
 	var out []item
 	for _, a := range apps {
@@ -442,6 +448,7 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 				DashboardURL:  s.dashboardLink("application", a.UUID),
 				ExpiresAt:     p.ExpiresAt,
 				NextResetAt:   p.NextResetAt,
+				IdleExpiresAt: p.IdleExpiresAt,
 			})
 		}
 	}
@@ -452,14 +459,15 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(sv.Description, "yeet:") {
 			p := policies[sv.UUID]
 			out = append(out, item{
-				UUID:         sv.UUID,
-				Name:         sv.Name,
-				Kind:         "service",
-				Description:  sv.Description,
-				Status:       sv.Status,
-				DashboardURL: s.dashboardLink("service", sv.UUID),
-				ExpiresAt:    p.ExpiresAt,
-				NextResetAt:  p.NextResetAt,
+				UUID:          sv.UUID,
+				Name:          sv.Name,
+				Kind:          "service",
+				Description:   sv.Description,
+				Status:        sv.Status,
+				DashboardURL:  s.dashboardLink("service", sv.UUID),
+				ExpiresAt:     p.ExpiresAt,
+				NextResetAt:   p.NextResetAt,
+				IdleExpiresAt: p.IdleExpiresAt,
 			})
 		}
 	}
@@ -589,7 +597,26 @@ func (s *server) authenticatePublicRequest(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded, try again shortly"))
 		return nil
 	}
+	s.renewIdleExpiry(project, slug)
 	return project
+}
+
+// renewIdleExpiry pushes an instance's idle deadline forward on every
+// authenticated wake/status hit, so "idle" ends up meaning "nobody's
+// asked about this in idle_timeout_seconds" - no traffic/usage signal
+// needed. Best-effort: a failure here shouldn't block the actual request.
+func (s *server) renewIdleExpiry(project *store.Project, slug string) {
+	_, spec, err := s.db.GetProjectBySlug(slug)
+	if err != nil || spec.IdleTimeoutSeconds == nil {
+		return
+	}
+	latest, err := s.db.LatestInstance(project.ID)
+	if err != nil || latest == nil || latest.Deleted {
+		return
+	}
+	if err := s.db.RenewIdleExpiry(latest.CoolifyUUID, *spec.IdleTimeoutSeconds); err != nil {
+		log.Printf("renew idle expiry for %s: %v", latest.CoolifyUUID, err)
+	}
 }
 
 type wakeStatus struct {
@@ -664,7 +691,10 @@ func (s *server) wakeProject(project *store.Project, slug string) (wakeStatus, e
 		if err != nil {
 			return wakeStatus{}, err
 		}
-		if err := s.db.CreateInstance(project.ID, slug, result.UUID, result.Kind, nil, nil); err != nil {
+		// Carry the project's own TTL/reset/idle policy forward - without
+		// this, an instance deleted by its own TTL would come back from a
+		// wake with no policy at all, silently running forever afterward.
+		if err := s.db.CreateInstance(project.ID, slug, result.UUID, result.Kind, spec.TTLSeconds, spec.ResetIntervalSeconds, spec.IdleTimeoutSeconds); err != nil {
 			log.Printf("record woken instance: %v", err)
 		}
 		return wakeStatus{Status: "starting", URL: domain}, nil
