@@ -207,62 +207,109 @@ func (r *Reconciler) enforceExpiry(e store.EnforceableInstance, eventKind string
 	_ = r.db.RecordEvent(&e.InstanceID, e.ProjectID, eventKind, "stopped")
 }
 
-// enforceReset implements "auto-reset" as delete-then-recreate from the
-// project's stored source spec, rather than an in-place volume wipe -
-// this is guaranteed to work with endpoints yeet already calls, whereas
-// Coolify's API surface for wiping a specific volume in place is
-// unverified. The domain is reused as-is so the instance's URL survives
-// the reset.
-func (r *Reconciler) enforceReset(e store.EnforceableInstance) {
+// recreateFromSpec deletes the current Coolify resource and creates a
+// fresh one from spec at the same domain - the guts of "reset", shared by
+// both the reaper's scheduled trigger and the on-demand ResetNow trigger
+// so manual and automatic resets behave identically. Delete-then-recreate
+// rather than an in-place volume wipe: guaranteed to work with endpoints
+// yeet already calls, whereas Coolify's API surface for wiping a specific
+// volume in place is unverified.
+func (r *Reconciler) recreateFromSpec(coolifyUUID, coolifyKind, fqdn string, spec store.ProjectSpec) (*coolify.DeployResult, error) {
 	var deleteErr error
-	if e.CoolifyKind == "application" {
-		deleteErr = r.client.DeleteApplication(e.CoolifyUUID)
+	if coolifyKind == "application" {
+		deleteErr = r.client.DeleteApplication(coolifyUUID)
 	} else {
-		deleteErr = r.client.DeleteService(e.CoolifyUUID)
+		deleteErr = r.client.DeleteService(coolifyUUID)
 	}
 	if deleteErr != nil {
-		log.Printf("reconcile: reset delete %s: %v", e.CoolifyUUID, deleteErr)
-		_ = r.db.RecordEvent(&e.InstanceID, e.ProjectID, "error", "reset delete: "+deleteErr.Error())
-		return
+		return nil, fmt.Errorf("delete: %w", deleteErr)
 	}
 
 	result, err := r.client.CreateFromSpec(coolify.DeploySpec{
-		SourceType:      e.Spec.SourceType,
+		SourceType:      spec.SourceType,
 		ProjectUUID:     r.projectUUID,
 		ServerUUID:      r.serverUUID,
 		EnvironmentName: r.environmentName,
 		GithubAppUUID:   r.githubAppUUID,
-		GitRepository:   e.Spec.GitRepository,
-		GitBranch:       e.Spec.GitBranch,
-		BuildPack:       e.Spec.BuildPack,
-		Dockerfile:      e.Spec.DockerfileBlob,
-		Compose:         e.Spec.ComposeBlob,
-		PortsExposes:    e.Spec.PortsExposes,
-		Name:            e.Spec.Name,
-		Description:     "yeet: " + e.Spec.Name,
-		Domains:         e.FQDN,
+		GitRepository:   spec.GitRepository,
+		GitBranch:       spec.GitBranch,
+		BuildPack:       spec.BuildPack,
+		Dockerfile:      spec.DockerfileBlob,
+		Compose:         spec.ComposeBlob,
+		PortsExposes:    spec.PortsExposes,
+		Name:            spec.Name,
+		Description:     "yeet: " + spec.Name,
+		Domains:         fqdn,
 		// The old resource holding this domain was just deleted by us,
 		// above - Coolify's domain-uniqueness check can lag behind that
 		// deletion by a moment and 409 otherwise (observed in testing).
 		ForceDomainOverride: true,
-		Envs:                coolify.ParseEnvBlob(e.Spec.EnvsBlob),
+		Envs:                coolify.ParseEnvBlob(spec.EnvsBlob),
 	})
 	if err != nil {
-		log.Printf("reconcile: reset recreate for project %d: %v", e.ProjectID, err)
-		_ = r.db.RecordEvent(&e.InstanceID, e.ProjectID, "error", "reset recreate: "+err.Error())
-		// The old resource is already gone - mark the instance deleted so
-		// it doesn't linger as a live row pointing at nothing. The next
-		// manual deploy (or a future retry policy) starts fresh.
-		_ = r.db.MarkInstanceDeleted(e.CoolifyUUID)
+		return nil, fmt.Errorf("recreate: %w", err)
+	}
+	return result, nil
+}
+
+func (r *Reconciler) enforceReset(e store.EnforceableInstance) {
+	result, err := r.recreateFromSpec(e.CoolifyUUID, e.CoolifyKind, e.FQDN, e.Spec)
+	if err != nil {
+		log.Printf("reconcile: reset for project %d: %v", e.ProjectID, err)
+		_ = r.db.RecordEvent(&e.InstanceID, e.ProjectID, "error", "reset: "+err.Error())
+		if !strings.HasPrefix(err.Error(), "delete:") {
+			// Delete succeeded (the failure was in recreate) - the old
+			// resource is already gone, so mark the instance deleted so
+			// it doesn't linger as a live row pointing at nothing.
+			_ = r.db.MarkInstanceDeleted(e.CoolifyUUID)
+		}
 		return
 	}
 
-	if err := r.db.ApplyReset(e.InstanceID, result.UUID, *e.ResetIntervalSeconds); err != nil {
+	if err := r.db.ApplyReset(e.InstanceID, result.UUID, e.ResetIntervalSeconds); err != nil {
 		log.Printf("reconcile: apply reset for instance %d: %v", e.InstanceID, err)
 		return
 	}
 	_ = r.db.UpdateInstanceObserved(result.UUID, "", e.FQDN, time.Now())
 	_ = r.db.RecordEvent(&e.InstanceID, e.ProjectID, "reset", "recreated")
+}
+
+// ResetNow performs an immediate reset for a project's current live
+// instance, bypassing any configured timer - used by the admin "reset
+// now" endpoint. Shares recreateFromSpec with the scheduled path, so a
+// manual reset behaves exactly like a timer-triggered one; the only
+// difference is nothing waited for a deadline to fire it.
+func (r *Reconciler) ResetNow(slug string) error {
+	project, spec, err := r.db.GetProjectBySlug(slug)
+	if err != nil {
+		return fmt.Errorf("get project %q: %w", slug, err)
+	}
+	if project == nil {
+		return fmt.Errorf("project %q not found", slug)
+	}
+	latest, err := r.db.LatestInstance(project.ID)
+	if err != nil {
+		return fmt.Errorf("get latest instance for %q: %w", slug, err)
+	}
+	if latest == nil || latest.Deleted {
+		return fmt.Errorf("project %q has no live instance to reset", slug)
+	}
+
+	result, err := r.recreateFromSpec(latest.CoolifyUUID, latest.CoolifyKind, latest.FQDN, spec)
+	if err != nil {
+		_ = r.db.RecordEvent(&latest.ID, project.ID, "error", "manual reset: "+err.Error())
+		if !strings.HasPrefix(err.Error(), "delete:") {
+			_ = r.db.MarkInstanceDeleted(latest.CoolifyUUID)
+		}
+		return err
+	}
+
+	if err := r.db.ApplyReset(latest.ID, result.UUID, spec.ResetIntervalSeconds); err != nil {
+		return fmt.Errorf("apply reset: %w", err)
+	}
+	_ = r.db.UpdateInstanceObserved(result.UUID, "", latest.FQDN, time.Now())
+	_ = r.db.RecordEvent(&latest.ID, project.ID, "reset", "manual")
+	return nil
 }
 
 // parseMarker reads the "yeet:v2 project=<slug> instance=<short_id>"
