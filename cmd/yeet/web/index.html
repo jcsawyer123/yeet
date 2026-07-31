@@ -112,6 +112,10 @@
       Delete instead of stop when the timer expires
     </label>
 
+    <label>Domain pattern (optional)</label>
+    <input name="domain_pattern" id="domain-pattern" placeholder="{{"{{id}}"}}.{{.BaseDomain}}">
+    <p style="font-size:.8rem; color:#888; margin:.3rem 0 0">Preview: <span id="domain-preview">yeet-abc123.{{.BaseDomain}}</span></p>
+
     <p style="font-size:.75rem; color:#888; margin:.4rem 0 0">Health checks and stop/reset timers aren't applied to docker-compose deploys.</p>
   </details>
 
@@ -131,7 +135,17 @@ const typeSel = document.getElementById("type");
 const advanced = document.getElementById("advanced");
 const healthCheckEnabled = document.getElementById("health-check-enabled");
 const healthCheckPath = document.getElementById("health-check-path");
-const policyFields = document.querySelectorAll('[name="ttl_minutes"], [name="reset_interval_minutes"], [name="expiry_delete"]');
+const policyFields = document.querySelectorAll('[name="ttl_minutes"], [name="reset_interval_minutes"], [name="expiry_delete"], [name="domain_pattern"]');
+const domainPatternInput = document.getElementById("domain-pattern");
+const domainPreview = document.getElementById("domain-preview");
+const baseDomain = {{.BaseDomain}};
+
+function updateDomainPreview() {
+  const pattern = domainPatternInput.value.trim() || ("{id}." + baseDomain);
+  domainPreview.textContent = pattern.replace("{id}", "yeet-abc123");
+}
+domainPatternInput.addEventListener("input", updateDomainPreview);
+updateDomainPreview();
 
 function syncPanels() {
   panels.forEach(p => {
