@@ -328,6 +328,7 @@ async function loadList() {
     const actionsCell = el("td", { class: "row-actions" },
       el("button", { "data-action": "stop", text: "stop" }),
       el("button", { "data-action": "start", text: "start" }),
+      el("button", { "data-action": "reset", text: "reset" }),
       el("button", { "data-action": "delete", class: "danger", text: "delete" }),
     );
 
@@ -350,6 +351,14 @@ async function loadList() {
       b.addEventListener("click", async () => {
         const action = b.dataset.action;
         if (action === "delete" && !confirm(`Delete "${item.name}"? This can't be undone.`)) return;
+        if (action === "reset" && !confirm(`Reset "${item.name}" now? This deletes and recreates it - any data inside is lost.`)) return;
+        if (action === "reset") {
+          // Reset is keyed by project slug (== item.name by convention),
+          // not the Coolify uuid - different route entirely.
+          await fetch(`/api/projects/${encodeURIComponent(item.name)}/reset`, { method: "POST" });
+          loadList();
+          return;
+        }
         const method = action === "delete" ? "DELETE" : "POST";
         const path = action === "delete" ? base + item.uuid : base + item.uuid + "/" + action;
         await fetch(path, { method });
