@@ -148,9 +148,11 @@ func (r *Reconciler) adopt(uuid, name, description, status, fqdn, kind string) e
 	return r.db.UpdateInstanceObserved(uuid, status, fqdn, time.Now())
 }
 
-// enforce evaluates every instance with a TTL or reset policy and acts on
-// any that are due. It's only called from Run right after a successful
-// reconcile, so observed data here is at most one tick stale.
+// enforce evaluates every instance with a TTL, idle-timeout, or reset
+// policy and acts on any that are due. It's only called from Run right
+// after a successful reconcile, so observed data here is at most one tick
+// stale. TTL is checked before idle so an absolute deadline always wins
+// over a rolling one if both somehow fire the same tick.
 func (r *Reconciler) enforce() {
 	enforceable, err := r.db.ListEnforceable()
 	if err != nil {
@@ -162,14 +164,20 @@ func (r *Reconciler) enforce() {
 	for _, e := range enforceable {
 		switch {
 		case e.ExpiresAt != nil && !e.ExpiresAt.After(now):
-			r.enforceTTL(e)
+			r.enforceExpiry(e, "ttl_expired", func() error { return r.db.ClearInstanceExpiry(e.InstanceID) })
+		case e.IdleExpiresAt != nil && !e.IdleExpiresAt.After(now):
+			r.enforceExpiry(e, "idle_expired", func() error { return r.db.ClearIdleExpiry(e.InstanceID) })
 		case e.NextResetAt != nil && !e.NextResetAt.After(now):
 			r.enforceReset(e)
 		}
 	}
 }
 
-func (r *Reconciler) enforceTTL(e store.EnforceableInstance) {
+// enforceExpiry applies the project's expiry_action (stop or delete) and
+// is shared by both TTL and idle-timeout firing - they differ only in
+// which deadline column triggered them and which column gets cleared
+// afterward (clearAfterStop), not in what action actually happens.
+func (r *Reconciler) enforceExpiry(e store.EnforceableInstance, eventKind string, clearAfterStop func() error) {
 	del := e.ExpiryAction == "delete"
 	var err error
 	switch {
@@ -183,20 +191,20 @@ func (r *Reconciler) enforceTTL(e store.EnforceableInstance) {
 		err = r.client.StopService(e.CoolifyUUID)
 	}
 	if err != nil {
-		log.Printf("reconcile: ttl action on %s: %v", e.CoolifyUUID, err)
-		_ = r.db.RecordEvent(&e.InstanceID, e.ProjectID, "error", "ttl: "+err.Error())
+		log.Printf("reconcile: %s action on %s: %v", eventKind, e.CoolifyUUID, err)
+		_ = r.db.RecordEvent(&e.InstanceID, e.ProjectID, "error", eventKind+": "+err.Error())
 		return
 	}
 
 	if del {
 		_ = r.db.MarkInstanceDeleted(e.CoolifyUUID)
-		_ = r.db.RecordEvent(&e.InstanceID, e.ProjectID, "ttl_expired", "deleted")
+		_ = r.db.RecordEvent(&e.InstanceID, e.ProjectID, eventKind, "deleted")
 		return
 	}
-	if err := r.db.ClearInstanceExpiry(e.InstanceID); err != nil {
-		log.Printf("reconcile: clear expiry for %s: %v", e.CoolifyUUID, err)
+	if err := clearAfterStop(); err != nil {
+		log.Printf("reconcile: clear deadline for %s: %v", e.CoolifyUUID, err)
 	}
-	_ = r.db.RecordEvent(&e.InstanceID, e.ProjectID, "ttl_expired", "stopped")
+	_ = r.db.RecordEvent(&e.InstanceID, e.ProjectID, eventKind, "stopped")
 }
 
 // enforceReset implements "auto-reset" as delete-then-recreate from the
