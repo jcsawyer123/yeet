@@ -285,8 +285,16 @@ func (db *DB) ClearIdleExpiry(instanceID int64) error {
 // changes (the old resource was deleted and a new one made), and its next
 // reset deadline moves forward. observed_state/fqdn are cleared here and
 // refreshed by the next call to UpdateInstanceObserved.
-func (db *DB) ApplyReset(instanceID int64, newCoolifyUUID string, resetIntervalSeconds int64) error {
-	next := time.Now().Add(time.Duration(resetIntervalSeconds) * time.Second).Unix()
+// ApplyReset records that an instance was recreated. resetIntervalSeconds
+// is nil for a one-off manual reset with no recurring schedule configured
+// - next_reset_at is left unset rather than inventing a schedule that was
+// never asked for.
+func (db *DB) ApplyReset(instanceID int64, newCoolifyUUID string, resetIntervalSeconds *int64) error {
+	var next *int64
+	if resetIntervalSeconds != nil {
+		v := time.Now().Add(time.Duration(*resetIntervalSeconds) * time.Second).Unix()
+		next = &v
+	}
 	_, err := db.sql.Exec(`
 		UPDATE instance
 		SET coolify_uuid = ?, next_reset_at = ?, observed_state = NULL, observed_at = NULL
