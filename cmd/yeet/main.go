@@ -180,6 +180,7 @@ func main() {
 	mux.HandleFunc("POST /api/services/{uuid}/start", s.handleServiceAction("start"))
 	mux.HandleFunc("DELETE /api/services/{uuid}", s.handleServiceAction("delete"))
 	mux.HandleFunc("POST /api/projects/{slug}/tokens", s.handleCreateTriggerToken)
+	mux.HandleFunc("POST /api/projects/{slug}/reset", s.handleResetNow)
 	mux.HandleFunc("POST /api/v1/public/projects/{slug}/wake", s.handleWake)
 	mux.HandleFunc("GET /api/v1/public/projects/{slug}/status", s.handlePublicStatus)
 	mux.HandleFunc("GET /go/{slug}", s.handleGoRedirect)
@@ -543,6 +544,24 @@ func (s *server) handleCreateTriggerToken(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, map[string]string{"token": token})
+}
+
+// handleResetNow triggers an immediate delete-then-recreate for a
+// project's current instance, bypassing any configured reset timer -
+// reuses the exact same mechanics as a scheduled reset (see
+// reconcile.Reconciler.ResetNow), so this behaves identically to one
+// firing on schedule.
+func (s *server) handleResetNow(w http.ResponseWriter, r *http.Request) {
+	if s.reconciler == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("database not available"))
+		return
+	}
+	slug := r.PathValue("slug")
+	if err := s.reconciler.ResetNow(slug); err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // --- Public: on-demand wake ---
