@@ -19,8 +19,17 @@
   textarea { min-height: 8rem; font-family: ui-monospace, monospace; font-size: .85rem; }
   button { padding: .55rem 1.1rem; font: inherit; border: none; border-radius: 4px; background: #2563eb; color: #fff; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
+  button:focus-visible, .type-tab:focus-visible, .expand-btn:focus-visible, summary:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+  .type-tabs { display: flex; gap: .4rem; flex-wrap: wrap; }
+  .type-tab { padding: .4rem .8rem; font: inherit; font-size: .85rem; border: 1px solid #8886; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; }
+  .type-tab.active { background: #2563eb; border-color: #2563eb; color: #fff; }
   .type-panel { display: none; }
   .type-panel.active { display: block; }
+  #deploy-section { margin-top: 2rem; }
+  #deploy-section summary { cursor: pointer; font-weight: 600; font-size: 1rem; padding-bottom: .6rem; border-bottom: 1px solid #8883; }
+  #deploy-section form { margin-top: 1rem; }
+  .field-group-label { font-size: .85rem; font-weight: 600; margin: 1.1rem 0 .3rem; }
+  .field-group-label:first-child { margin-top: 0; }
   #advanced { border: 1px solid #8883; border-radius: 6px; padding: .6rem 1rem; margin-top: 1rem; }
   #advanced summary { cursor: pointer; font-size: .85rem; }
   #advanced[disabled] { opacity: .5; pointer-events: none; }
@@ -28,7 +37,9 @@
   #result.ok { display: block; background: #16a34a22; border: 1px solid #16a34a55; }
   #result.err { display: block; background: #dc262622; border: 1px solid #dc262655; }
   #result a { font-weight: 600; }
+  .table-scroll { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
+  .empty-state { color: #888; font-size: .9rem; padding: 1rem .3rem; }
   td, th { text-align: left; padding: .4rem .3rem; border-bottom: 1px solid #8883; font-size: .85rem; }
   .row-actions button { padding: .25rem .55rem; font-size: .8rem; margin-right: .3rem; background: #6b728033; color: inherit; }
   .row-actions button.danger { background: #dc262633; }
@@ -50,14 +61,17 @@
 <h1>yeet</h1>
 <p class="sub">hey {{.Who}} — deploy something to *.{{.BaseDomain}}</p>
 
+<details id="deploy-section" open>
+<summary>New deployment</summary>
 <form id="deploy-form">
   <label>Type</label>
-  <select id="type" name="type">
-    <option value="github">Private GitHub repo</option>
-    <option value="public">Public git repo</option>
-    <option value="dockerfile">Dockerfile</option>
-    <option value="compose">docker-compose</option>
-  </select>
+  <div class="type-tabs" role="tablist">
+    <button type="button" class="type-tab" data-type="github">Private GitHub repo</button>
+    <button type="button" class="type-tab" data-type="public">Public git repo</button>
+    <button type="button" class="type-tab" data-type="dockerfile">Dockerfile</button>
+    <button type="button" class="type-tab" data-type="compose">docker-compose</button>
+  </div>
+  <input type="hidden" id="type" name="type" value="github">
 
   <div class="type-panel" data-type="github">
     <label>Repository (owner/repo)</label>
@@ -94,6 +108,8 @@
 
   <details id="advanced">
     <summary>Advanced</summary>
+
+    <div class="field-group-label">Health check</div>
     <label style="display:flex; align-items:center; gap:.4rem; margin-top:.6rem">
       <input type="checkbox" name="health_check_enabled" id="health-check-enabled" style="width:auto">
       Enable health check
@@ -101,6 +117,7 @@
     <label>Health check path</label>
     <input name="health_check_path" id="health-check-path" placeholder="/healthz" disabled>
 
+    <div class="field-group-label">Lifecycle</div>
     <label>Stop after (minutes, optional)</label>
     <input name="ttl_minutes" placeholder="e.g. 60 for 1 hour">
 
@@ -112,25 +129,30 @@
       Delete instead of stop when the timer expires
     </label>
 
-    <label>Domain pattern (optional)</label>
+    <div class="field-group-label">Domain</div>
+    <label>Pattern (optional)</label>
     <input name="domain_pattern" id="domain-pattern" placeholder="{{"{{id}}"}}.{{.BaseDomain}}">
     <p style="font-size:.8rem; color:#888; margin:.3rem 0 0">Preview: <span id="domain-preview">yeet-abc123.{{.BaseDomain}}</span></p>
 
-    <p style="font-size:.75rem; color:#888; margin:.4rem 0 0">Health checks and stop/reset timers aren't applied to docker-compose deploys.</p>
+    <p style="font-size:.75rem; color:#888; margin:1rem 0 0">Health checks and stop/reset timers aren't applied to docker-compose deploys.</p>
   </details>
 
   <div style="margin-top:1rem">
-    <button type="submit">Deploy</button>
+    <button type="submit" id="deploy-btn">Deploy</button>
   </div>
 </form>
+</details>
 
 <div id="result"></div>
 
 <h2 style="margin-top:2.5rem; font-size:1.1rem">Your deployments</h2>
+<div class="table-scroll">
 <table id="list"><tbody></tbody></table>
+</div>
 
 <script>
 const panels = document.querySelectorAll(".type-panel");
+const typeTabs = document.querySelectorAll(".type-tab");
 const typeSel = document.getElementById("type");
 const advanced = document.getElementById("advanced");
 const healthCheckEnabled = document.getElementById("health-check-enabled");
@@ -148,6 +170,7 @@ domainPatternInput.addEventListener("input", updateDomainPreview);
 updateDomainPreview();
 
 function syncPanels() {
+  typeTabs.forEach(t => t.classList.toggle("active", t.dataset.type === typeSel.value));
   panels.forEach(p => {
     const active = p.dataset.type === typeSel.value;
     p.classList.toggle("active", active);
@@ -163,13 +186,18 @@ function syncPanels() {
   healthCheckPath.disabled = composeSelected || !healthCheckEnabled.checked;
   policyFields.forEach(el => { el.disabled = composeSelected; });
 }
-typeSel.addEventListener("change", syncPanels);
+typeTabs.forEach(t => t.addEventListener("click", () => {
+  typeSel.value = t.dataset.type;
+  syncPanels();
+}));
 healthCheckEnabled.addEventListener("change", syncPanels);
 syncPanels();
 
 document.getElementById("deploy-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const btn = e.target.querySelector("button");
+  // Not e.target.querySelector("button") - the type tabs are <button>
+  // elements inside this form too now, and would match first.
+  const btn = document.getElementById("deploy-btn");
   const result = document.getElementById("result");
   const fd = new FormData(e.target);
   const body = Object.fromEntries(fd.entries());
@@ -187,6 +215,7 @@ document.getElementById("deploy-form").addEventListener("submit", async (e) => {
   }
 
   btn.disabled = true;
+  btn.textContent = "Deploying…";
   result.className = "";
   result.textContent = "";
 
@@ -206,6 +235,7 @@ document.getElementById("deploy-form").addEventListener("submit", async (e) => {
     result.textContent = "Error: " + err.message;
   } finally {
     btn.disabled = false;
+    btn.textContent = "Deploy";
   }
 });
 
@@ -249,7 +279,12 @@ async function loadList() {
   const tbody = document.querySelector("#list tbody");
   tbody.innerHTML = "";
 
-  (items || []).forEach(item => {
+  if (!items || items.length === 0) {
+    tbody.appendChild(el("tr", {}, el("td", { class: "empty-state", colspan: "4", text: "No deployments yet - use the form above to create one." })));
+    return;
+  }
+
+  items.forEach(item => {
     const base = item.kind === "application" ? "/api/apps/" : "/api/services/";
 
     const expandBtn = el("button", { class: "expand-btn", type: "button", "aria-label": "toggle details" });
@@ -300,6 +335,7 @@ async function loadList() {
     tr.querySelectorAll("button[data-action]").forEach(b => {
       b.addEventListener("click", async () => {
         const action = b.dataset.action;
+        if (action === "delete" && !confirm(`Delete "${item.name}"? This can't be undone.`)) return;
         const method = action === "delete" ? "DELETE" : "POST";
         const path = action === "delete" ? base + item.uuid : base + item.uuid + "/" + action;
         await fetch(path, { method });
@@ -311,7 +347,20 @@ async function loadList() {
     tbody.appendChild(detailRow);
   });
 }
-loadList();
+
+// Keep status/countdowns live without a manual reload - paused while the
+// tab isn't visible, so it's not doing pointless work in a background tab.
+let refreshTimer = null;
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  if (document.hidden) return;
+  refreshTimer = setTimeout(() => loadList().then(scheduleRefresh), 5000);
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) scheduleRefresh();
+});
+
+loadList().then(scheduleRefresh);
 </script>
 </body>
 </html>
