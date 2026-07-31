@@ -115,6 +115,7 @@ type ProjectSpec struct {
 	TTLSeconds           *int64
 	ResetIntervalSeconds *int64
 	ExpiryAction         string // "stop" | "delete"
+	DomainPattern        string // "" means the default {id}.<first allowed base>
 }
 
 // CreateProjectWithSpec registers a new project with its source spec and
@@ -130,11 +131,11 @@ func (db *DB) CreateProjectWithSpec(spec ProjectSpec) (*Project, error) {
 		INSERT INTO project (
 			slug, name, kind, source_type, git_repository, git_branch, build_pack,
 			dockerfile_blob, compose_blob, ports_exposes, ttl_seconds,
-			reset_interval_seconds, expiry_action, created_at, updated_at
-		) VALUES (?, ?, 'adhoc', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			reset_interval_seconds, expiry_action, domain_pattern, created_at, updated_at
+		) VALUES (?, ?, 'adhoc', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		spec.Name, spec.Name, spec.SourceType, spec.GitRepository, spec.GitBranch, spec.BuildPack,
 		spec.DockerfileBlob, spec.ComposeBlob, spec.PortsExposes, spec.TTLSeconds,
-		spec.ResetIntervalSeconds, expiryAction, now, now)
+		spec.ResetIntervalSeconds, expiryAction, spec.DomainPattern, now, now)
 	if err != nil {
 		return nil, fmt.Errorf("create project %q: %w", spec.Name, err)
 	}
@@ -320,10 +321,10 @@ func (db *DB) GetProjectBySlug(slug string) (*Project, ProjectSpec, error) {
 	var spec ProjectSpec
 	err := db.sql.QueryRow(`
 		SELECT id, slug, name, kind, source_type, git_repository, git_branch,
-		       build_pack, dockerfile_blob, compose_blob, ports_exposes
+		       build_pack, dockerfile_blob, compose_blob, ports_exposes, domain_pattern
 		FROM project WHERE slug = ?`, slug).
 		Scan(&p.ID, &p.Slug, &p.Name, &p.Kind, &spec.SourceType, &spec.GitRepository, &spec.GitBranch,
-			&spec.BuildPack, &spec.DockerfileBlob, &spec.ComposeBlob, &spec.PortsExposes)
+			&spec.BuildPack, &spec.DockerfileBlob, &spec.ComposeBlob, &spec.PortsExposes, &spec.DomainPattern)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ProjectSpec{}, nil
 	}
