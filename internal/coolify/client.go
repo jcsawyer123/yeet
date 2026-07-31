@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -252,6 +253,47 @@ func (c *Client) ListEnvironments(projectUUID string) ([]Environment, error) {
 	return out, err
 }
 
+// --- Environment variables ---
+
+type EnvVar struct {
+	Key   string
+	Value string
+}
+
+// BulkSetApplicationEnvs sets env vars on an application in one call.
+// A no-op on an empty list, so callers don't need to special-case it.
+func (c *Client) BulkSetApplicationEnvs(uuid string, envs []EnvVar) error {
+	if len(envs) == 0 {
+		return nil
+	}
+	data := make([]map[string]any, len(envs))
+	for i, e := range envs {
+		data[i] = map[string]any{"key": e.Key, "value": e.Value, "is_preview": false}
+	}
+	return c.do(http.MethodPatch, "/api/v1/applications/"+uuid+"/envs/bulk", map[string]any{"data": data}, nil)
+}
+
+// ParseEnvBlob parses .env-style text (one KEY=VALUE per line; blank lines
+// and lines starting with # are skipped) into EnvVars. The value is split
+// on the first "=" only, so values containing "=" are preserved intact.
+func ParseEnvBlob(blob string) []EnvVar {
+	var envs []EnvVar
+	for _, line := range strings.Split(blob, "\n") {
+		line = strings.TrimRight(line, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(trimmed, "=")
+		key = strings.TrimSpace(key)
+		if !ok || key == "" {
+			continue
+		}
+		envs = append(envs, EnvVar{Key: key, Value: value})
+	}
+	return envs
+}
+
 // --- Source-agnostic create dispatch ---
 //
 // DeploySpec/CreateFromSpec exist so there is exactly one place that maps
@@ -282,6 +324,11 @@ type DeploySpec struct {
 	// otherwise 409s in a real race: a resource we just deleted ourselves
 	// can still be reported as holding the domain for a moment afterward.
 	ForceDomainOverride bool
+	// Envs is set on the application after creation, before it's deployed,
+	// so the first build/run already has them. Not wired for "compose" -
+	// docker-compose deploys should define env vars directly in the
+	// compose file's own environment: block instead.
+	Envs []EnvVar
 }
 
 type DeployResult struct {
@@ -312,6 +359,9 @@ func (c *Client) CreateFromSpec(spec DeploySpec) (*DeployResult, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := c.BulkSetApplicationEnvs(res.UUID, spec.Envs); err != nil {
+			return nil, err
+		}
 		return &DeployResult{UUID: res.UUID, Kind: "application"}, c.DeployApplication(res.UUID)
 
 	case "public":
@@ -331,6 +381,9 @@ func (c *Client) CreateFromSpec(spec DeploySpec) (*DeployResult, error) {
 			ForceDomainOverride: spec.ForceDomainOverride,
 		})
 		if err != nil {
+			return nil, err
+		}
+		if err := c.BulkSetApplicationEnvs(res.UUID, spec.Envs); err != nil {
 			return nil, err
 		}
 		return &DeployResult{UUID: res.UUID, Kind: "application"}, c.DeployApplication(res.UUID)
@@ -360,6 +413,9 @@ func (c *Client) CreateFromSpec(spec DeploySpec) (*DeployResult, error) {
 			if err := c.UpdateApplicationPortsExposes(res.UUID, spec.PortsExposes); err != nil {
 				return nil, err
 			}
+		}
+		if err := c.BulkSetApplicationEnvs(res.UUID, spec.Envs); err != nil {
+			return nil, err
 		}
 		return &DeployResult{UUID: res.UUID, Kind: "application"}, c.DeployApplication(res.UUID)
 
