@@ -11,14 +11,18 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jcsawyer123/yeet/internal/coolify"
+	"github.com/jcsawyer123/yeet/internal/ratelimit"
 	"github.com/jcsawyer123/yeet/internal/reconcile"
 	"github.com/jcsawyer123/yeet/internal/store"
+	"golang.org/x/time/rate"
 )
 
 //go:embed web/*.html
@@ -110,6 +114,8 @@ type server struct {
 	tmpl            *template.Template
 	environmentUUID string    // resolved best-effort at startup, used only for dashboard deep links
 	db              *store.DB // nil if the database couldn't be opened - policy features degrade to no-ops
+	publicLimiter   *ratelimit.Limiter
+	wakeLocks       sync.Map // slug -> *sync.Mutex, serializes concurrent wake calls per project
 }
 
 func main() {
@@ -118,6 +124,9 @@ func main() {
 		cfg:    cfg,
 		client: coolify.NewClient(cfg.CoolifyBaseURL, cfg.CoolifyToken),
 		tmpl:   template.Must(template.ParseFS(webFS, "web/*.html")),
+		// Per (project, ip): burst 5, then 1 request per 12s. maxKeys
+		// bounds memory on a public, unauthenticated-by-IP endpoint.
+		publicLimiter: ratelimit.New(rate.Limit(1.0/12.0), 5, 10000),
 	}
 	s.resolveEnvironmentUUID()
 
@@ -144,6 +153,10 @@ func main() {
 	mux.HandleFunc("POST /api/services/{uuid}/stop", s.handleServiceAction("stop"))
 	mux.HandleFunc("POST /api/services/{uuid}/start", s.handleServiceAction("start"))
 	mux.HandleFunc("DELETE /api/services/{uuid}", s.handleServiceAction("delete"))
+	mux.HandleFunc("POST /api/projects/{slug}/tokens", s.handleCreateTriggerToken)
+	mux.HandleFunc("POST /api/v1/public/projects/{slug}/wake", s.handleWake)
+	mux.HandleFunc("GET /api/v1/public/projects/{slug}/status", s.handlePublicStatus)
+	mux.HandleFunc("GET /go/{slug}", s.handleGoRedirect)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -444,6 +457,215 @@ func (s *server) handleServiceAction(action string) http.HandlerFunc {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// --- Admin: trigger token issuance ---
+
+func (s *server) handleCreateTriggerToken(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("database not available"))
+		return
+	}
+	slug := r.PathValue("slug")
+	project, _, err := s.db.GetProjectBySlug(slug)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if project == nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("project %q not found (it needs to have been deployed at least once)", slug))
+		return
+	}
+
+	var body struct {
+		Label string `json:"label"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body) // label is optional
+
+	token, err := s.db.CreateTriggerToken(project.ID, body.Label)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, map[string]string{"token": token})
+}
+
+// --- Public: on-demand wake ---
+
+func bearerToken(r *http.Request) string {
+	if t := r.URL.Query().Get("t"); t != "" {
+		return t
+	}
+	if after, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
+		return after
+	}
+	return ""
+}
+
+// clientIP trusts X-Forwarded-For because Traefik, the outermost L7 hop
+// in this deployment, sets it - Caddy's passthrough for *.dev.jcsx.me is
+// a raw TCP proxy (see architecture-overview.md) that never touches HTTP
+// headers, so there's no untrusted intermediate hop adding its own value.
+func clientIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		if i := strings.IndexByte(fwd, ','); i >= 0 {
+			return strings.TrimSpace(fwd[:i])
+		}
+		return strings.TrimSpace(fwd)
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func (s *server) wakeLock(slug string) *sync.Mutex {
+	v, _ := s.wakeLocks.LoadOrStore(slug, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+func (s *server) authenticatePublicRequest(w http.ResponseWriter, r *http.Request, slug string) *store.Project {
+	if s.db == nil {
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("database not available"))
+		return nil
+	}
+	project, err := s.db.ValidateTriggerToken(slug, bearerToken(r))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return nil
+	}
+	if project == nil {
+		writeErr(w, http.StatusUnauthorized, fmt.Errorf("invalid token"))
+		return nil
+	}
+	if !s.publicLimiter.Allow(slug + "|" + clientIP(r)) {
+		writeErr(w, http.StatusTooManyRequests, fmt.Errorf("rate limit exceeded, try again shortly"))
+		return nil
+	}
+	return project
+}
+
+type wakeStatus struct {
+	Status string `json:"status"` // "ready" | "starting"
+	URL    string `json:"url,omitempty"`
+}
+
+func (s *server) handleWake(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	project := s.authenticatePublicRequest(w, r, slug)
+	if project == nil {
+		return
+	}
+
+	lock := s.wakeLock(slug)
+	lock.Lock()
+	defer lock.Unlock()
+
+	result, err := s.wakeProject(project, slug)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if result.Status == "ready" {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusAccepted)
+	}
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// wakeProject decides what, if anything, needs to happen: nothing (already
+// running), start (exists but stopped), or recreate (never deployed, or
+// its last instance was deleted - e.g. by a TTL policy).
+func (s *server) wakeProject(project *store.Project, slug string) (wakeStatus, error) {
+	latest, err := s.db.LatestInstance(project.ID)
+	if err != nil {
+		return wakeStatus{}, err
+	}
+
+	if latest == nil || latest.Deleted {
+		_, spec, err := s.db.GetProjectBySlug(slug)
+		if err != nil {
+			return wakeStatus{}, err
+		}
+		domain := "https://" + slug + "." + s.cfg.BaseDomain
+		result, err := s.client.CreateFromSpec(coolify.DeploySpec{
+			SourceType:      spec.SourceType,
+			ProjectUUID:     s.cfg.ProjectUUID,
+			ServerUUID:      s.cfg.ServerUUID,
+			EnvironmentName: s.cfg.EnvironmentName,
+			GithubAppUUID:   s.cfg.GithubAppUUID,
+			GitRepository:   spec.GitRepository,
+			GitBranch:       spec.GitBranch,
+			BuildPack:       spec.BuildPack,
+			Dockerfile:      spec.DockerfileBlob,
+			Compose:         spec.ComposeBlob,
+			PortsExposes:    spec.PortsExposes,
+			Name:            slug,
+			Description:     "yeet: " + slug,
+			Domains:         domain,
+			// A just-deleted instance can still briefly hold the domain
+			// in Coolify's eyes (the same race fixed for reset).
+			ForceDomainOverride: latest != nil,
+		})
+		if err != nil {
+			return wakeStatus{}, err
+		}
+		if err := s.db.CreateInstance(project.ID, slug, result.UUID, result.Kind, nil, nil); err != nil {
+			log.Printf("record woken instance: %v", err)
+		}
+		return wakeStatus{Status: "starting", URL: domain}, nil
+	}
+
+	if strings.HasPrefix(latest.ObservedState, "running") {
+		return wakeStatus{Status: "ready", URL: latest.FQDN}, nil
+	}
+
+	var startErr error
+	if latest.CoolifyKind == "application" {
+		startErr = s.client.StartApplication(latest.CoolifyUUID)
+	} else {
+		startErr = s.client.StartService(latest.CoolifyUUID)
+	}
+	if startErr != nil {
+		return wakeStatus{}, startErr
+	}
+	return wakeStatus{Status: "starting", URL: latest.FQDN}, nil
+}
+
+func (s *server) handlePublicStatus(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	project := s.authenticatePublicRequest(w, r, slug)
+	if project == nil {
+		return
+	}
+
+	latest, err := s.db.LatestInstance(project.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	status := "not_found"
+	var url string
+	if latest != nil && !latest.Deleted {
+		url = latest.FQDN
+		if strings.HasPrefix(latest.ObservedState, "running") {
+			status = "ready"
+		} else {
+			status = "starting"
+		}
+	}
+	writeJSON(w, wakeStatus{Status: status, URL: url})
+}
+
+func (s *server) handleGoRedirect(w http.ResponseWriter, r *http.Request) {
+	if err := s.tmpl.ExecuteTemplate(w, "go.html", map[string]any{
+		"Slug":  r.PathValue("slug"),
+		"Token": r.URL.Query().Get("t"),
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 

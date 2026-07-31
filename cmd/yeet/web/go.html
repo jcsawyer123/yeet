@@ -1,0 +1,68 @@
+{{define "go.html"}}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Starting…</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 -apple-system, system-ui, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; text-align: center; }
+  .msg { max-width: 320px; padding: 0 1.25rem; }
+  .spinner { width: 2rem; height: 2rem; border: 3px solid #8886; border-top-color: #2563eb; border-radius: 50%; margin: 0 auto 1rem; animation: spin 800ms linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #error { display: none; color: #dc2626; }
+  a { color: #2563eb; }
+</style>
+</head>
+<body>
+<div class="msg">
+  <div class="spinner" id="spinner"></div>
+  <p id="text">Starting up, this can take a minute…</p>
+  <p id="error">Something went wrong. <a href="javascript:location.reload()">Try again</a>.</p>
+</div>
+<script>
+const slug = {{.Slug}};
+const token = {{.Token}};
+const startedAt = Date.now();
+const TIMEOUT_MS = 3 * 60 * 1000;
+
+function showError() {
+  document.getElementById("spinner").style.display = "none";
+  document.getElementById("text").style.display = "none";
+  document.getElementById("error").style.display = "block";
+}
+
+async function poll() {
+  if (Date.now() - startedAt > TIMEOUT_MS) {
+    showError();
+    return;
+  }
+  try {
+    const res = await fetch(`/api/v1/public/projects/${slug}/status`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ready" && data.url) {
+      window.location.href = data.url;
+      return;
+    }
+  } catch (e) { /* transient - keep polling */ }
+  setTimeout(poll, 2000);
+}
+
+async function wake() {
+  try {
+    await fetch(`/api/v1/public/projects/${slug}/wake`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (e) { /* fall through to polling regardless */ }
+  poll();
+}
+
+wake();
+</script>
+</body>
+</html>
+{{end}}
