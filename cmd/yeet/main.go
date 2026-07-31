@@ -132,8 +132,16 @@ type server struct {
 	environmentUUID string    // resolved best-effort at startup, used only for dashboard deep links
 	db              *store.DB // nil if the database couldn't be opened - policy features degrade to no-ops
 	publicLimiter   *ratelimit.Limiter
-	wakeLocks       sync.Map // slug -> *sync.Mutex, serializes concurrent wake calls per project
+	wakeLocks       sync.Map              // slug -> *sync.Mutex, serializes concurrent wake calls per project
+	reconciler      *reconcile.Reconciler // nil if the database couldn't be opened - no reaper to run without it
+	startedAt       time.Time
 }
+
+// reaperStaleAfter is how long without a successful reconcile tick before
+// /healthz reports degraded. The reaper ticks every 30s; this is 6 missed
+// ticks in a row - long enough that a transient Coolify blip won't trip
+// it, but short enough to actually catch a hung goroutine promptly.
+const reaperStaleAfter = 3 * time.Minute
 
 func main() {
 	cfg := loadConfig()
@@ -144,6 +152,7 @@ func main() {
 		// Per (project, ip): burst 5, then 1 request per 12s. maxKeys
 		// bounds memory on a public, unauthenticated-by-IP endpoint.
 		publicLimiter: ratelimit.New(rate.Limit(1.0/12.0), 5, 10000),
+		startedAt:     time.Now(),
 	}
 	s.resolveEnvironmentUUID()
 
@@ -156,8 +165,8 @@ func main() {
 	} else {
 		s.db = db
 		defer db.Close()
-		go reconcile.New(s.client, db, cfg.SelfUUID, cfg.ProjectUUID, cfg.ServerUUID, cfg.EnvironmentName, cfg.GithubAppUUID).
-			Run(context.Background(), 30*time.Second)
+		s.reconciler = reconcile.New(s.client, db, cfg.SelfUUID, cfg.ProjectUUID, cfg.ServerUUID, cfg.EnvironmentName, cfg.GithubAppUUID)
+		go s.reconciler.Run(context.Background(), 30*time.Second)
 	}
 
 	mux := http.NewServeMux()
@@ -174,10 +183,7 @@ func main() {
 	mux.HandleFunc("POST /api/v1/public/projects/{slug}/wake", s.handleWake)
 	mux.HandleFunc("GET /api/v1/public/projects/{slug}/status", s.handlePublicStatus)
 	mux.HandleFunc("GET /go/{slug}", s.handleGoRedirect)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	log.Printf("yeet listening on %s", cfg.ListenAddr)
 	log.Fatal(http.ListenAndServe(cfg.ListenAddr, hostGate(cfg.AdminHost, mux)))
@@ -703,6 +709,35 @@ func (s *server) handlePublicStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, wakeStatus{Status: status, URL: url})
+}
+
+// handleHealthz reports 503 if the reaper's dead-man's-switch has tripped -
+// no successful reconcile tick in reaperStaleAfter - so a hung reaper
+// goroutine is visible instead of silently leaving TTL/reset unenforced.
+// yeet's core deploy/list/manage flow doesn't depend on this, so a stale
+// reaper degrades this endpoint only, not the whole tool.
+func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	resp := map[string]any{"status": "ok"}
+
+	if s.reconciler == nil {
+		resp["reaper"] = "disabled"
+	} else {
+		last := s.reconciler.LastTick()
+		age := time.Since(s.startedAt)
+		if !last.IsZero() {
+			age = time.Since(last)
+		}
+		stale := age > reaperStaleAfter
+		resp["reaper"] = map[string]any{
+			"last_tick_age_seconds": int(age.Seconds()),
+			"stale":                 stale,
+		}
+		if stale {
+			resp["status"] = "degraded"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}
+	writeJSON(w, resp)
 }
 
 func (s *server) handleGoRedirect(w http.ResponseWriter, r *http.Request) {
