@@ -269,6 +269,9 @@ type deployRequest struct {
 	// the original fixed scheme ({id}.<BASE_DOMAIN>). Must resolve to
 	// exactly one label under an allowed base domain - see domainpattern.
 	DomainPattern string `json:"domain_pattern,omitempty"`
+	// Envs is raw .env-style text (one KEY=VALUE per line). Not supported
+	// for "compose" - define env vars directly in the compose file itself.
+	Envs string `json:"envs,omitempty"`
 }
 
 type deployResponse struct {
@@ -285,6 +288,10 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Type == "compose" && (req.TTLSeconds != nil || req.ResetIntervalSeconds != nil) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("ttl/reset policy isn't supported for compose deploys yet"))
+		return
+	}
+	if req.Type == "compose" && req.Envs != "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("envs aren't supported for compose deploys - define them in the compose file's environment: block instead"))
 		return
 	}
 
@@ -324,6 +331,7 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		Domains:            domain,
 		HealthCheckEnabled: req.HealthCheckEnabled,
 		HealthCheckPath:    req.HealthCheckPath,
+		Envs:               coolify.ParseEnvBlob(req.Envs),
 	}
 
 	result, err := s.client.CreateFromSpec(spec)
@@ -333,10 +341,10 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// A project row is worth creating even without TTL/reset policy when a
-	// custom domain pattern was requested, so wake (Phase 3) can later
-	// re-resolve the same pattern rather than falling back to the default.
-	if req.TTLSeconds != nil || req.ResetIntervalSeconds != nil || req.DomainPattern != "" {
-		if err := s.registerPolicy(spec, result, domain, req.TTLSeconds, req.ResetIntervalSeconds, req.ExpiryAction, req.DomainPattern); err != nil {
+	// custom domain pattern or env vars were requested, so wake (Phase 3)
+	// and reset can later reuse them rather than falling back to defaults.
+	if req.TTLSeconds != nil || req.ResetIntervalSeconds != nil || req.DomainPattern != "" || req.Envs != "" {
+		if err := s.registerPolicy(spec, result, domain, req.TTLSeconds, req.ResetIntervalSeconds, req.ExpiryAction, req.DomainPattern, req.Envs); err != nil {
 			// The deploy itself succeeded - a policy bookkeeping failure
 			// shouldn't fail the whole request, just means no TTL/reset
 			// will be enforced for it. Log so it's not silently lost.
@@ -350,7 +358,7 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 // registerPolicy records a project+instance with TTL/reset policy and/or
 // domain pattern for a deploy that just succeeded. A no-op if the
 // database isn't available.
-func (s *server) registerPolicy(spec coolify.DeploySpec, result *coolify.DeployResult, domain string, ttl, resetInterval *int64, expiryAction, domainPattern string) error {
+func (s *server) registerPolicy(spec coolify.DeploySpec, result *coolify.DeployResult, domain string, ttl, resetInterval *int64, expiryAction, domainPattern, envsBlob string) error {
 	if s.db == nil {
 		return fmt.Errorf("database not available")
 	}
@@ -367,6 +375,7 @@ func (s *server) registerPolicy(spec coolify.DeploySpec, result *coolify.DeployR
 		ResetIntervalSeconds: resetInterval,
 		ExpiryAction:         expiryAction,
 		DomainPattern:        domainPattern,
+		EnvsBlob:             envsBlob,
 	})
 	if err != nil {
 		return err
@@ -644,6 +653,7 @@ func (s *server) wakeProject(project *store.Project, slug string) (wakeStatus, e
 			// A just-deleted instance can still briefly hold the domain
 			// in Coolify's eyes (the same race fixed for reset).
 			ForceDomainOverride: latest != nil,
+			Envs:                coolify.ParseEnvBlob(spec.EnvsBlob),
 		})
 		if err != nil {
 			return wakeStatus{}, err
