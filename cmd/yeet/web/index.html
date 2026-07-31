@@ -124,6 +124,9 @@
     <label>Reset every (minutes, optional)</label>
     <input name="reset_interval_minutes" placeholder="e.g. 1440 for daily">
 
+    <label>Stop if idle for (minutes, optional)</label>
+    <input name="idle_timeout_minutes" placeholder="e.g. 30 - resets on every wake/status check">
+
     <label style="display:flex; align-items:center; gap:.4rem; margin-top:.6rem">
       <input type="checkbox" name="expiry_delete" id="expiry-delete" style="width:auto">
       Delete instead of stop when the timer expires
@@ -161,7 +164,7 @@ const typeSel = document.getElementById("type");
 const advanced = document.getElementById("advanced");
 const healthCheckEnabled = document.getElementById("health-check-enabled");
 const healthCheckPath = document.getElementById("health-check-path");
-const policyFields = document.querySelectorAll('[name="ttl_minutes"], [name="reset_interval_minutes"], [name="expiry_delete"], [name="domain_pattern"], [name="envs"]');
+const policyFields = document.querySelectorAll('[name="ttl_minutes"], [name="reset_interval_minutes"], [name="idle_timeout_minutes"], [name="expiry_delete"], [name="domain_pattern"], [name="envs"]');
 const domainPatternInput = document.getElementById("domain-pattern");
 const domainPreview = document.getElementById("domain-preview");
 const baseDomain = {{.BaseDomain}};
@@ -209,12 +212,15 @@ document.getElementById("deploy-form").addEventListener("submit", async (e) => {
 
   const ttlMinutes = parseInt(body.ttl_minutes, 10);
   const resetMinutes = parseInt(body.reset_interval_minutes, 10);
+  const idleMinutes = parseInt(body.idle_timeout_minutes, 10);
   delete body.ttl_minutes;
   delete body.reset_interval_minutes;
+  delete body.idle_timeout_minutes;
   delete body.expiry_delete;
   if (Number.isFinite(ttlMinutes) && ttlMinutes > 0) body.ttl_seconds = ttlMinutes * 60;
   if (Number.isFinite(resetMinutes) && resetMinutes > 0) body.reset_interval_seconds = resetMinutes * 60;
-  if (body.ttl_seconds || body.reset_interval_seconds) {
+  if (Number.isFinite(idleMinutes) && idleMinutes > 0) body.idle_timeout_seconds = idleMinutes * 60;
+  if (body.ttl_seconds || body.reset_interval_seconds || body.idle_timeout_seconds) {
     body.expiry_action = fd.has("expiry_delete") ? "delete" : "stop";
   }
 
@@ -313,6 +319,10 @@ async function loadList() {
     if (item.next_reset_at) {
       statusCell.appendChild(document.createTextNode(" "));
       statusCell.appendChild(el("span", { class: "status-badge status-other", text: "resets in " + relativeMinutes(item.next_reset_at) }));
+    }
+    if (item.idle_expires_at) {
+      statusCell.appendChild(document.createTextNode(" "));
+      statusCell.appendChild(el("span", { class: "status-badge status-other", text: "idle-stops in " + relativeMinutes(item.idle_expires_at) }));
     }
 
     const actionsCell = el("td", { class: "row-actions" },
