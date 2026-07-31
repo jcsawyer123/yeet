@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jcsawyer123/yeet/internal/coolify"
@@ -32,6 +33,9 @@ type Reconciler struct {
 	serverUUID      string
 	environmentName string
 	githubAppUUID   string
+
+	tickMu   sync.Mutex
+	lastTick time.Time // updated after every successful reconcile - dead-man's-switch for /healthz
 }
 
 func New(client *coolify.Client, db *store.DB, selfUUID, projectUUID, serverUUID, environmentName, githubAppUUID string) *Reconciler {
@@ -54,6 +58,9 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration) {
 		if err := r.reconcile(); err != nil {
 			log.Printf("reconcile: %v", err)
 		} else {
+			r.tickMu.Lock()
+			r.lastTick = time.Now()
+			r.tickMu.Unlock()
 			r.enforce()
 		}
 		select {
@@ -62,6 +69,16 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 		}
 	}
+}
+
+// LastTick returns when reconcile last succeeded - a dead-man's-switch.
+// A goroutine panic would already crash the whole process (Go re-panics
+// on an unrecovered goroutine), so what this actually catches is a hang:
+// reconcile blocking forever on some external call and never returning.
+func (r *Reconciler) LastTick() time.Time {
+	r.tickMu.Lock()
+	defer r.tickMu.Unlock()
+	return r.lastTick
 }
 
 func (r *Reconciler) reconcile() error {
