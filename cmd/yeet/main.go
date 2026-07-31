@@ -706,6 +706,11 @@ func (s *server) handlePublicStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleGoRedirect(w http.ResponseWriter, r *http.Request) {
+	// The token is in the URL (unavoidable for a page with no backend to
+	// hide it behind - see the design note in main.go's public API
+	// section). Without this, it would otherwise leak via the Referer
+	// header on the page's own outbound navigation to the woken app.
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	if err := s.tmpl.ExecuteTemplate(w, "go.html", map[string]any{
 		"Slug":  r.PathValue("slug"),
 		"Token": r.URL.Query().Get("t"),
