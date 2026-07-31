@@ -114,6 +114,7 @@ type ProjectSpec struct {
 	PortsExposes         string
 	TTLSeconds           *int64
 	ResetIntervalSeconds *int64
+	IdleTimeoutSeconds   *int64 // rolling window, renewed on every wake/status hit - see RenewIdleExpiry
 	ExpiryAction         string // "stop" | "delete"
 	DomainPattern        string // "" means the default {id}.<first allowed base>
 	EnvsBlob             string // raw .env-style text; parse with coolify.ParseEnvBlob
@@ -132,11 +133,11 @@ func (db *DB) CreateProjectWithSpec(spec ProjectSpec) (*Project, error) {
 		INSERT INTO project (
 			slug, name, kind, source_type, git_repository, git_branch, build_pack,
 			dockerfile_blob, compose_blob, ports_exposes, ttl_seconds,
-			reset_interval_seconds, expiry_action, domain_pattern, envs_blob, created_at, updated_at
-		) VALUES (?, ?, 'adhoc', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			reset_interval_seconds, idle_timeout_seconds, expiry_action, domain_pattern, envs_blob, created_at, updated_at
+		) VALUES (?, ?, 'adhoc', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		spec.Name, spec.Name, spec.SourceType, spec.GitRepository, spec.GitBranch, spec.BuildPack,
 		spec.DockerfileBlob, spec.ComposeBlob, spec.PortsExposes, spec.TTLSeconds,
-		spec.ResetIntervalSeconds, expiryAction, spec.DomainPattern, spec.EnvsBlob, now, now)
+		spec.ResetIntervalSeconds, spec.IdleTimeoutSeconds, expiryAction, spec.DomainPattern, spec.EnvsBlob, now, now)
 	if err != nil {
 		return nil, fmt.Errorf("create project %q: %w", spec.Name, err)
 	}
@@ -154,9 +155,9 @@ func (db *DB) CreateProjectWithSpec(spec ProjectSpec) (*Project, error) {
 // policy computed into concrete deadlines. Unlike UpsertInstance (used by
 // the reconciler for resources it didn't create), a conflict here is a
 // genuine bug - the coolify_uuid was just minted - so it's a plain INSERT.
-func (db *DB) CreateInstance(projectID int64, shortID, coolifyUUID, coolifyKind string, ttlSeconds, resetIntervalSeconds *int64) error {
+func (db *DB) CreateInstance(projectID int64, shortID, coolifyUUID, coolifyKind string, ttlSeconds, resetIntervalSeconds, idleTimeoutSeconds *int64) error {
 	now := time.Now()
-	var expiresAt, nextResetAt *int64
+	var expiresAt, nextResetAt, idleExpiresAt *int64
 	if ttlSeconds != nil {
 		v := now.Add(time.Duration(*ttlSeconds) * time.Second).Unix()
 		expiresAt = &v
@@ -165,10 +166,14 @@ func (db *DB) CreateInstance(projectID int64, shortID, coolifyUUID, coolifyKind 
 		v := now.Add(time.Duration(*resetIntervalSeconds) * time.Second).Unix()
 		nextResetAt = &v
 	}
+	if idleTimeoutSeconds != nil {
+		v := now.Add(time.Duration(*idleTimeoutSeconds) * time.Second).Unix()
+		idleExpiresAt = &v
+	}
 	_, err := db.sql.Exec(`
-		INSERT INTO instance (project_id, short_id, coolify_uuid, coolify_kind, expires_at, next_reset_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		projectID, shortID, coolifyUUID, coolifyKind, expiresAt, nextResetAt, now.Unix())
+		INSERT INTO instance (project_id, short_id, coolify_uuid, coolify_kind, expires_at, next_reset_at, idle_expires_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		projectID, shortID, coolifyUUID, coolifyKind, expiresAt, nextResetAt, idleExpiresAt, now.Unix())
 	if err != nil {
 		return fmt.Errorf("create instance %q: %w", coolifyUUID, err)
 	}
@@ -185,24 +190,25 @@ type EnforceableInstance struct {
 	FQDN                 string
 	ExpiresAt            *time.Time
 	NextResetAt          *time.Time
+	IdleExpiresAt        *time.Time
 	ExpiryAction         string
 	ResetIntervalSeconds *int64
 	Spec                 ProjectSpec
 }
 
-// ListEnforceable returns every live instance whose project has a TTL or
-// reset policy configured. Instances adopted without a policy (legacy
-// resources, or projects created without one) are excluded at the SQL
-// level so the reaper never has to special-case them.
+// ListEnforceable returns every live instance whose project has a TTL,
+// reset, or idle-timeout policy configured. Instances adopted without a
+// policy (legacy resources, or projects created without one) are excluded
+// at the SQL level so the reaper never has to special-case them.
 func (db *DB) ListEnforceable() ([]EnforceableInstance, error) {
 	rows, err := db.sql.Query(`
-		SELECT i.id, i.project_id, i.coolify_uuid, i.coolify_kind, i.fqdn, i.expires_at, i.next_reset_at,
+		SELECT i.id, i.project_id, i.coolify_uuid, i.coolify_kind, i.fqdn, i.expires_at, i.next_reset_at, i.idle_expires_at,
 		       p.expiry_action, p.reset_interval_seconds, p.name, p.source_type, p.git_repository,
 		       p.git_branch, p.build_pack, p.dockerfile_blob, p.compose_blob, p.ports_exposes, p.envs_blob
 		FROM instance i
 		JOIN project p ON p.id = i.project_id
 		WHERE i.deleted_at IS NULL
-		  AND (i.expires_at IS NOT NULL OR i.next_reset_at IS NOT NULL)`)
+		  AND (i.expires_at IS NOT NULL OR i.next_reset_at IS NOT NULL OR i.idle_expires_at IS NOT NULL)`)
 	if err != nil {
 		return nil, fmt.Errorf("list enforceable instances: %w", err)
 	}
@@ -212,9 +218,9 @@ func (db *DB) ListEnforceable() ([]EnforceableInstance, error) {
 	for rows.Next() {
 		var e EnforceableInstance
 		var fqdn sql.NullString
-		var expiresAt, nextResetAt, resetIntervalSeconds sql.NullInt64
+		var expiresAt, nextResetAt, idleExpiresAt, resetIntervalSeconds sql.NullInt64
 		if err := rows.Scan(
-			&e.InstanceID, &e.ProjectID, &e.CoolifyUUID, &e.CoolifyKind, &fqdn, &expiresAt, &nextResetAt,
+			&e.InstanceID, &e.ProjectID, &e.CoolifyUUID, &e.CoolifyKind, &fqdn, &expiresAt, &nextResetAt, &idleExpiresAt,
 			&e.ExpiryAction, &resetIntervalSeconds, &e.Spec.Name, &e.Spec.SourceType, &e.Spec.GitRepository,
 			&e.Spec.GitBranch, &e.Spec.BuildPack, &e.Spec.DockerfileBlob, &e.Spec.ComposeBlob, &e.Spec.PortsExposes, &e.Spec.EnvsBlob,
 		); err != nil {
@@ -228,6 +234,10 @@ func (db *DB) ListEnforceable() ([]EnforceableInstance, error) {
 		if nextResetAt.Valid {
 			t := time.Unix(nextResetAt.Int64, 0)
 			e.NextResetAt = &t
+		}
+		if idleExpiresAt.Valid {
+			t := time.Unix(idleExpiresAt.Int64, 0)
+			e.IdleExpiresAt = &t
 		}
 		if resetIntervalSeconds.Valid {
 			e.ResetIntervalSeconds = &resetIntervalSeconds.Int64
@@ -243,6 +253,30 @@ func (db *DB) ClearInstanceExpiry(instanceID int64) error {
 	_, err := db.sql.Exec(`UPDATE instance SET expires_at = NULL WHERE id = ?`, instanceID)
 	if err != nil {
 		return fmt.Errorf("clear expiry for instance %d: %w", instanceID, err)
+	}
+	return nil
+}
+
+// RenewIdleExpiry pushes an instance's idle deadline forward - called on
+// every wake/status hit for a project with an idle timeout configured, so
+// "idle" ends up meaning "nobody's asked about this in idleTimeoutSeconds"
+// rather than needing any actual traffic/usage signal.
+func (db *DB) RenewIdleExpiry(coolifyUUID string, idleTimeoutSeconds int64) error {
+	next := time.Now().Add(time.Duration(idleTimeoutSeconds) * time.Second).Unix()
+	_, err := db.sql.Exec(`UPDATE instance SET idle_expires_at = ? WHERE coolify_uuid = ?`, next, coolifyUUID)
+	if err != nil {
+		return fmt.Errorf("renew idle expiry for %q: %w", coolifyUUID, err)
+	}
+	return nil
+}
+
+// ClearIdleExpiry stops an idle timeout from re-firing every tick once
+// it's fired and been acted on (stop is one-shot until the next wake
+// renews it, same reasoning as ClearInstanceExpiry for TTL).
+func (db *DB) ClearIdleExpiry(instanceID int64) error {
+	_, err := db.sql.Exec(`UPDATE instance SET idle_expires_at = NULL WHERE id = ?`, instanceID)
+	if err != nil {
+		return fmt.Errorf("clear idle expiry for instance %d: %w", instanceID, err)
 	}
 	return nil
 }
@@ -278,17 +312,18 @@ func (db *DB) RecordEvent(instanceID *int64, projectID int64, kind, detail strin
 }
 
 type InstancePolicy struct {
-	ExpiresAt   *time.Time
-	NextResetAt *time.Time
+	ExpiresAt     *time.Time
+	NextResetAt   *time.Time
+	IdleExpiresAt *time.Time
 }
 
-// ListInstancePolicies returns TTL/reset deadlines for every live instance
-// that has one, keyed by coolify_uuid, for the UI to show a countdown
-// without an N+1 query per listed item.
+// ListInstancePolicies returns TTL/reset/idle deadlines for every live
+// instance that has one, keyed by coolify_uuid, for the UI to show a
+// countdown without an N+1 query per listed item.
 func (db *DB) ListInstancePolicies() (map[string]InstancePolicy, error) {
 	rows, err := db.sql.Query(`
-		SELECT coolify_uuid, expires_at, next_reset_at FROM instance
-		WHERE deleted_at IS NULL AND (expires_at IS NOT NULL OR next_reset_at IS NOT NULL)`)
+		SELECT coolify_uuid, expires_at, next_reset_at, idle_expires_at FROM instance
+		WHERE deleted_at IS NULL AND (expires_at IS NOT NULL OR next_reset_at IS NOT NULL OR idle_expires_at IS NOT NULL)`)
 	if err != nil {
 		return nil, fmt.Errorf("list instance policies: %w", err)
 	}
@@ -297,8 +332,8 @@ func (db *DB) ListInstancePolicies() (map[string]InstancePolicy, error) {
 	out := make(map[string]InstancePolicy)
 	for rows.Next() {
 		var uuid string
-		var expiresAt, nextResetAt sql.NullInt64
-		if err := rows.Scan(&uuid, &expiresAt, &nextResetAt); err != nil {
+		var expiresAt, nextResetAt, idleExpiresAt sql.NullInt64
+		if err := rows.Scan(&uuid, &expiresAt, &nextResetAt, &idleExpiresAt); err != nil {
 			return nil, fmt.Errorf("scan instance policy: %w", err)
 		}
 		var p InstancePolicy
@@ -310,6 +345,10 @@ func (db *DB) ListInstancePolicies() (map[string]InstancePolicy, error) {
 			t := time.Unix(nextResetAt.Int64, 0)
 			p.NextResetAt = &t
 		}
+		if idleExpiresAt.Valid {
+			t := time.Unix(idleExpiresAt.Int64, 0)
+			p.IdleExpiresAt = &t
+		}
 		out[uuid] = p
 	}
 	return out, rows.Err()
@@ -320,12 +359,15 @@ func (db *DB) ListInstancePolicies() (map[string]InstancePolicy, error) {
 func (db *DB) GetProjectBySlug(slug string) (*Project, ProjectSpec, error) {
 	var p Project
 	var spec ProjectSpec
+	var ttlSeconds, resetIntervalSeconds, idleTimeoutSeconds sql.NullInt64
 	err := db.sql.QueryRow(`
 		SELECT id, slug, name, kind, source_type, git_repository, git_branch,
-		       build_pack, dockerfile_blob, compose_blob, ports_exposes, domain_pattern, envs_blob
+		       build_pack, dockerfile_blob, compose_blob, ports_exposes, domain_pattern, envs_blob,
+		       ttl_seconds, reset_interval_seconds, idle_timeout_seconds, expiry_action
 		FROM project WHERE slug = ?`, slug).
 		Scan(&p.ID, &p.Slug, &p.Name, &p.Kind, &spec.SourceType, &spec.GitRepository, &spec.GitBranch,
-			&spec.BuildPack, &spec.DockerfileBlob, &spec.ComposeBlob, &spec.PortsExposes, &spec.DomainPattern, &spec.EnvsBlob)
+			&spec.BuildPack, &spec.DockerfileBlob, &spec.ComposeBlob, &spec.PortsExposes, &spec.DomainPattern, &spec.EnvsBlob,
+			&ttlSeconds, &resetIntervalSeconds, &idleTimeoutSeconds, &spec.ExpiryAction)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ProjectSpec{}, nil
 	}
@@ -333,6 +375,15 @@ func (db *DB) GetProjectBySlug(slug string) (*Project, ProjectSpec, error) {
 		return nil, ProjectSpec{}, fmt.Errorf("get project %q: %w", slug, err)
 	}
 	spec.Name = p.Name
+	if ttlSeconds.Valid {
+		spec.TTLSeconds = &ttlSeconds.Int64
+	}
+	if resetIntervalSeconds.Valid {
+		spec.ResetIntervalSeconds = &resetIntervalSeconds.Int64
+	}
+	if idleTimeoutSeconds.Valid {
+		spec.IdleTimeoutSeconds = &idleTimeoutSeconds.Int64
+	}
 	return &p, spec, nil
 }
 
