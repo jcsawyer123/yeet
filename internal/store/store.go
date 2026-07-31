@@ -1,7 +1,12 @@
 package store
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -306,4 +311,104 @@ func (db *DB) ListInstancePolicies() (map[string]InstancePolicy, error) {
 		out[uuid] = p
 	}
 	return out, rows.Err()
+}
+
+// GetProjectBySlug fetches a project along with its source spec, needed to
+// recreate an instance for the wake path if the last one was deleted.
+func (db *DB) GetProjectBySlug(slug string) (*Project, ProjectSpec, error) {
+	var p Project
+	var spec ProjectSpec
+	err := db.sql.QueryRow(`
+		SELECT id, slug, name, kind, source_type, git_repository, git_branch,
+		       build_pack, dockerfile_blob, compose_blob, ports_exposes
+		FROM project WHERE slug = ?`, slug).
+		Scan(&p.ID, &p.Slug, &p.Name, &p.Kind, &spec.SourceType, &spec.GitRepository, &spec.GitBranch,
+			&spec.BuildPack, &spec.DockerfileBlob, &spec.ComposeBlob, &spec.PortsExposes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ProjectSpec{}, nil
+	}
+	if err != nil {
+		return nil, ProjectSpec{}, fmt.Errorf("get project %q: %w", slug, err)
+	}
+	spec.Name = p.Name
+	return &p, spec, nil
+}
+
+// InstanceRef is the minimal instance state the wake path needs to decide
+// what action (if any) to take.
+type InstanceRef struct {
+	ID            int64
+	CoolifyUUID   string
+	CoolifyKind   string
+	FQDN          string
+	ObservedState string
+	Deleted       bool
+}
+
+// LatestInstance returns the most recently created instance for a project,
+// deleted or not - the wake path uses this to tell "never deployed",
+// "deleted, needs recreating", and "exists, just needs starting" apart.
+func (db *DB) LatestInstance(projectID int64) (*InstanceRef, error) {
+	var ref InstanceRef
+	var fqdn, observedState sql.NullString
+	var deletedAt sql.NullInt64
+	err := db.sql.QueryRow(`
+		SELECT id, coolify_uuid, coolify_kind, fqdn, observed_state, deleted_at
+		FROM instance WHERE project_id = ? ORDER BY created_at DESC LIMIT 1`, projectID).
+		Scan(&ref.ID, &ref.CoolifyUUID, &ref.CoolifyKind, &fqdn, &observedState, &deletedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("latest instance for project %d: %w", projectID, err)
+	}
+	ref.FQDN = fqdn.String
+	ref.ObservedState = observedState.String
+	ref.Deleted = deletedAt.Valid
+	return &ref, nil
+}
+
+// CreateTriggerToken generates a fresh opaque token for a project and
+// stores only its hash - the plaintext is returned once and never
+// recoverable again.
+func (db *DB) CreateTriggerToken(projectID int64, label string) (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate token: %w", err)
+	}
+	token := base64.RawURLEncoding.EncodeToString(raw)
+	hash := sha256.Sum256([]byte(token))
+
+	_, err := db.sql.Exec(`
+		INSERT INTO trigger_token (project_id, token_hash, label, created_at)
+		VALUES (?, ?, ?, ?)`,
+		projectID, hex.EncodeToString(hash[:]), label, time.Now().Unix())
+	if err != nil {
+		return "", fmt.Errorf("store trigger token: %w", err)
+	}
+	return token, nil
+}
+
+// ValidateTriggerToken checks a presented token against the project it
+// claims to belong to. A nil, nil return means "invalid" (unknown
+// project, wrong token, or revoked) - callers should treat that as a
+// generic auth failure, not distinguish why.
+func (db *DB) ValidateTriggerToken(slug, token string) (*Project, error) {
+	project, _, err := db.GetProjectBySlug(slug)
+	if err != nil || project == nil {
+		return nil, err
+	}
+	hash := sha256.Sum256([]byte(token))
+	var count int
+	err = db.sql.QueryRow(`
+		SELECT COUNT(*) FROM trigger_token
+		WHERE project_id = ? AND token_hash = ? AND revoked_at IS NULL`,
+		project.ID, hex.EncodeToString(hash[:])).Scan(&count)
+	if err != nil {
+		return nil, fmt.Errorf("validate trigger token: %w", err)
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	return project, nil
 }
