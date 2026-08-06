@@ -43,6 +43,14 @@ type config struct {
 	DBPath             string
 	AdminHost          string
 	AllowedBaseDomains []string
+	// InternalBaseDomain backs the visibility:"private" shorthand on
+	// deployRequest - it's just which entry of AllowedBaseDomains that
+	// shorthand expands to, not a separate validation path. If it isn't
+	// also present in AllowedBaseDomains, domainpattern.Resolve rejects a
+	// private deploy with a clear error rather than silently routing
+	// somewhere uncertified - an operator misconfiguration surfaces at
+	// request time, not as a mysteriously unreachable deploy later.
+	InternalBaseDomain string
 }
 
 func loadConfig() config {
@@ -90,6 +98,11 @@ func loadConfig() config {
 	} else if cfg.BaseDomain != "" {
 		cfg.AllowedBaseDomains = []string{cfg.BaseDomain}
 	}
+	// Defaults to "internal." + BaseDomain (e.g. dev.jcsx.me ->
+	// internal.dev.jcsx.me) so visibility:"private" works out of the box
+	// once that's added to YEET_ALLOWED_BASE_DOMAINS, without needing a
+	// second env var just for the common case.
+	cfg.InternalBaseDomain = envOr("YEET_INTERNAL_BASE_DOMAIN", "internal."+cfg.BaseDomain)
 	missing := []string{}
 	for name, val := range map[string]string{
 		"COOLIFY_BASE_URL":     cfg.CoolifyBaseURL,
@@ -280,15 +293,24 @@ type deployRequest struct {
 	// the original fixed scheme ({id}.<BASE_DOMAIN>). Must resolve to
 	// exactly one label under an allowed base domain - see domainpattern.
 	DomainPattern string `json:"domain_pattern,omitempty"`
+	// Visibility is a convenience shorthand over DomainPattern, purely
+	// additive: leaving it unset preserves the original default (public,
+	// same as before this field existed - the web UI and any existing
+	// caller that doesn't send it sees zero behavior change). Only
+	// "private" or "public" (or omitted) are accepted - an unrecognized
+	// value is a 400, not a silent fallback. Ignored if DomainPattern is
+	// also set (explicit pattern wins).
+	Visibility string `json:"visibility,omitempty"`
 	// Envs is raw .env-style text (one KEY=VALUE per line). Not supported
 	// for "compose" - define env vars directly in the compose file itself.
 	Envs string `json:"envs,omitempty"`
 }
 
 type deployResponse struct {
-	URL  string `json:"url"`
-	UUID string `json:"uuid"`
-	Kind string `json:"kind"` // "application" | "service"
+	URL        string `json:"url"`
+	UUID       string `json:"uuid"`
+	Kind       string `json:"kind"` // "application" | "service"
+	Visibility string `json:"visibility"`
 }
 
 func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
@@ -303,6 +325,23 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Type == "compose" && req.Envs != "" {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("envs aren't supported for compose deploys - define them in the compose file's environment: block instead"))
+		return
+	}
+
+	// Visibility is a shorthand over DomainPattern, resolved here so
+	// everything downstream (registerPolicy's stored spec, the later
+	// wake/reset re-resolve at line ~707) sees a normal DomainPattern and
+	// doesn't need to know Visibility exists. An explicit DomainPattern
+	// always wins - Visibility only fills the gap when neither was set.
+	switch req.Visibility {
+	case "", "public":
+		// no-op: today's default behavior (public, via BASE_DOMAIN).
+	case "private":
+		if req.DomainPattern == "" {
+			req.DomainPattern = "{id}." + s.cfg.InternalBaseDomain
+		}
+	default:
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("unrecognized visibility %q - must be \"public\" or \"private\"", req.Visibility))
 		return
 	}
 
@@ -363,7 +402,11 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, deployResponse{URL: domain, UUID: result.UUID, Kind: result.Kind})
+	visibility := req.Visibility
+	if visibility == "" {
+		visibility = "public"
+	}
+	writeJSON(w, deployResponse{URL: domain, UUID: result.UUID, Kind: result.Kind, Visibility: visibility})
 }
 
 // registerPolicy records a project+instance with TTL/reset policy and/or
