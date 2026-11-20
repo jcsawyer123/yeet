@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jcsawyer123/yeet/internal/coolify"
+	"github.com/jcsawyer123/yeet/internal/marker"
 	"github.com/jcsawyer123/yeet/internal/store"
 )
 
@@ -100,7 +101,7 @@ func (r *Reconciler) reconcile() error {
 			log.Printf("reconcile: adopt application %s: %v", a.UUID, err)
 			continue
 		}
-		if strings.HasPrefix(a.Description, "yeet:") {
+		if marker.IsYeet(a.Description) {
 			seen[a.UUID] = true
 		}
 	}
@@ -112,7 +113,7 @@ func (r *Reconciler) reconcile() error {
 			log.Printf("reconcile: adopt service %s: %v", sv.UUID, err)
 			continue
 		}
-		if strings.HasPrefix(sv.Description, "yeet:") {
+		if marker.IsYeet(sv.Description) {
 			seen[sv.UUID] = true
 		}
 	}
@@ -133,10 +134,10 @@ func (r *Reconciler) reconcile() error {
 }
 
 func (r *Reconciler) adopt(uuid, name, description, status, fqdn, kind string) error {
-	if !strings.HasPrefix(description, "yeet:") {
+	slug, shortID, ok := marker.Parse(description, name)
+	if !ok {
 		return nil
 	}
-	slug, shortID := parseMarker(description, name)
 
 	project, err := r.db.GetOrCreateProject(slug, slug, "adhoc")
 	if err != nil {
@@ -238,7 +239,7 @@ func (r *Reconciler) recreateFromSpec(coolifyUUID, coolifyKind, fqdn string, spe
 		Compose:         spec.ComposeBlob,
 		PortsExposes:    spec.PortsExposes,
 		Name:            spec.Name,
-		Description:     "yeet: " + spec.Name,
+		Description:     marker.Format(spec.Name),
 		Domains:         fqdn,
 		// The old resource holding this domain was just deleted by us,
 		// above - Coolify's domain-uniqueness check can lag behind that
@@ -310,26 +311,4 @@ func (r *Reconciler) ResetNow(slug string) error {
 	_ = r.db.UpdateInstanceObserved(result.UUID, "", latest.FQDN, time.Now())
 	_ = r.db.RecordEvent(&latest.ID, project.ID, "reset", "manual")
 	return nil
-}
-
-// parseMarker reads the "yeet:v2 project=<slug> instance=<short_id>"
-// marker if present. Otherwise this is a legacy "yeet: <name>" resource
-// (everything deployed before this format existed), adopted as its own
-// single-instance ad-hoc project keyed by name.
-func parseMarker(description, name string) (slug, shortID string) {
-	if rest, ok := strings.CutPrefix(description, "yeet:v2 "); ok {
-		var project, instance string
-		for _, f := range strings.Fields(rest) {
-			if v, ok := strings.CutPrefix(f, "project="); ok {
-				project = v
-			}
-			if v, ok := strings.CutPrefix(f, "instance="); ok {
-				instance = v
-			}
-		}
-		if project != "" && instance != "" {
-			return project, instance
-		}
-	}
-	return name, name
 }

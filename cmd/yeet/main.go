@@ -20,6 +20,7 @@ import (
 
 	"github.com/jcsawyer123/yeet/internal/coolify"
 	"github.com/jcsawyer123/yeet/internal/domainpattern"
+	"github.com/jcsawyer123/yeet/internal/marker"
 	"github.com/jcsawyer123/yeet/internal/ratelimit"
 	"github.com/jcsawyer123/yeet/internal/reconcile"
 	"github.com/jcsawyer123/yeet/internal/store"
@@ -377,7 +378,7 @@ func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		Compose:            req.Compose,
 		PortsExposes:       req.Port,
 		Name:               name,
-		Description:        "yeet: " + name,
+		Description:        marker.Format(name),
 		Domains:            domain,
 		HealthCheckEnabled: req.HealthCheckEnabled,
 		HealthCheckPath:    req.HealthCheckPath,
@@ -476,10 +477,7 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	var out []item
 	for _, a := range apps {
-		if a.UUID == s.cfg.SelfUUID {
-			continue
-		}
-		if strings.HasPrefix(a.Description, "yeet:") {
+		if listable(s.cfg.SelfUUID, a.UUID, a.Description) {
 			p := policies[a.UUID]
 			out = append(out, item{
 				UUID:          a.UUID,
@@ -497,10 +495,7 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for _, sv := range services {
-		if sv.UUID == s.cfg.SelfUUID {
-			continue
-		}
-		if strings.HasPrefix(sv.Description, "yeet:") {
+		if listable(s.cfg.SelfUUID, sv.UUID, sv.Description) {
 			p := policies[sv.UUID]
 			out = append(out, item{
 				UUID:          sv.UUID,
@@ -516,6 +511,12 @@ func (s *server) handleList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, out)
+}
+
+// listable reports whether a Coolify resource belongs in yeet's deployment
+// list: yeet-owned (current or legacy marker), and not yeet itself.
+func listable(selfUUID, uuid, description string) bool {
+	return uuid != selfUUID && marker.IsYeet(description)
 }
 
 func (s *server) handleAppAction(action string) http.HandlerFunc {
@@ -743,7 +744,7 @@ func (s *server) wakeProject(project *store.Project, slug string) (wakeStatus, e
 			Compose:         spec.ComposeBlob,
 			PortsExposes:    spec.PortsExposes,
 			Name:            slug,
-			Description:     "yeet: " + slug,
+			Description:     marker.Format(slug),
 			Domains:         domain,
 			// A just-deleted instance can still briefly hold the domain
 			// in Coolify's eyes (the same race fixed for reset).
