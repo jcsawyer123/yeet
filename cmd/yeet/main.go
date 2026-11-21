@@ -99,11 +99,14 @@ func loadConfig() config {
 	} else if cfg.BaseDomain != "" {
 		cfg.AllowedBaseDomains = []string{cfg.BaseDomain}
 	}
-	// Defaults to "internal." + BaseDomain (e.g. dev.jcsx.me ->
-	// internal.dev.jcsx.me) so visibility:"private" works out of the box
-	// once that's added to YEET_ALLOWED_BASE_DOMAINS, without needing a
-	// second env var just for the common case.
-	cfg.InternalBaseDomain = envOr("YEET_INTERNAL_BASE_DOMAIN", "internal."+cfg.BaseDomain)
+	// Defaults to int.jcsx.me, a zone with no public DNS at all (Pi-hole
+	// answers it on the LAN). It used to be "internal." + BaseDomain
+	// (internal.dev.jcsx.me), but that sits under the public *.dev.jcsx.me
+	// wildcard: whenever Pi-hole's override missed, clients silently got
+	// the WAN IP and a confusing TLS error. With int.jcsx.me a miss is a
+	// clean DNS failure. It still has to be listed in
+	// YEET_ALLOWED_BASE_DOMAINS for private deploys to work (see above).
+	cfg.InternalBaseDomain = envOr("YEET_INTERNAL_BASE_DOMAIN", "int.jcsx.me")
 	missing := []string{}
 	for name, val := range map[string]string{
 		"COOLIFY_BASE_URL":     cfg.CoolifyBaseURL,
